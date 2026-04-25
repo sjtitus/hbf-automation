@@ -13,18 +13,15 @@ data/*.xls
 data/*.xlsx
 data/*.csv
 
-# --- Sensitive: real shipping invoices ---
-# Production PDFs contain customer names, addresses, amounts.
-badger-invoices/*.pdf
-scotlyn-invoices/*.pdf
-mrs-invoices/*.pdf
-
-# --- Sensitive: examples ---
-# Reference screenshots / sample PDFs may show real customer data.
-examples/**/*.png
-examples/**/*.pdf
-examples/**/*.jpg
-examples/**/*.jpeg
+# --- Sensitive: per-vendor input drop-zones ---
+# All contents are real customer materials. Track only the .gitkeep
+# placeholder so the directories exist after a fresh clone.
+badger-invoices/*
+!badger-invoices/.gitkeep
+scotlyn-invoices/*
+!scotlyn-invoices/.gitkeep
+mrs-invoices/*
+!mrs-invoices/.gitkeep
 
 # --- Generated runtime artifacts ---
 logs/

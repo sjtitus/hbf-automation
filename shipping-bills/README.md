@@ -103,8 +103,6 @@ Each run creates `logs/<vendor>-YYYY-MM-DDTHH-MM-SSET-XXXXXX/` containing:
 │           └── rules.py          # Badger business rules + build_bill_entry
 ├── data/
 │   └── hbf-customers.xls         # Customer master list (editable)
-├── examples/
-│   └── badger/                   # Sample PDFs and reference screenshots
 ├── badger-invoices/              # Drop-zone for invoice PDFs to process
 ├── quickbooks-imports/           # Generated batch-bills CSVs (one per run)
 ├── logs/                         # Per-run dirs: run.log, per-invoice .log, summary.csv, manifest.json

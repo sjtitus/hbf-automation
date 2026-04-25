@@ -58,7 +58,6 @@ hbf_shipping/                          # The package
       rules.py                         # Badger business rules (bill-date, due-date, shipper→category)
 data/
   hbf-customers.xls                    # Customer master list (editable)
-examples/badger/                       # Sample PDFs and reference screenshots
 badger-invoices/                       # Drop-zone for Badger invoice PDFs
 quickbooks-imports/                    # Generated batch-bills CSVs (one per run)
 logs/<run-id>/                         # Per-run dir: run.log + <invoice>.log + summary.csv + manifest.json
