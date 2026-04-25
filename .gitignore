@@ -1,0 +1,14 @@
+# Repo-wide rules. Per-project rules live in <project>/.gitignore.
+
+# --- Python ---
+venv/
+__pycache__/
+*.pyc
+
+# --- Editor / OS ---
+.DS_Store
+.claude/settings.local.json
+
+# --- Misc legacy / secrets ---
+.qb-browser-profile/
+.env

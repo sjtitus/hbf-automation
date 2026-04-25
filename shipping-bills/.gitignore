@@ -1,0 +1,35 @@
+# --- Python ---
+venv/
+__pycache__/
+*.pyc
+
+# --- Editor / OS ---
+.DS_Store
+.claude/settings.local.json
+
+# --- Sensitive: customer master ---
+# Master customer list contains business-confidential names. Stays local.
+data/*.xls
+data/*.xlsx
+data/*.csv
+
+# --- Sensitive: real shipping invoices ---
+# Production PDFs contain customer names, addresses, amounts.
+badger-invoices/*.pdf
+scotlyn-invoices/*.pdf
+mrs-invoices/*.pdf
+
+# --- Sensitive: examples ---
+# Reference screenshots / sample PDFs may show real customer data.
+examples/**/*.png
+examples/**/*.pdf
+examples/**/*.jpg
+examples/**/*.jpeg
+
+# --- Generated runtime artifacts ---
+logs/
+quickbooks-imports/
+
+# --- Misc legacy / secrets ---
+.qb-browser-profile/
+.env

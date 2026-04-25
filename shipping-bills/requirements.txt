@@ -1,0 +1,8 @@
+et_xmlfile==2.0.0
+openpyxl==3.1.5
+pillow==12.2.0
+pypdf==6.9.2
+pytesseract==0.3.13
+python-dateutil==2.9.0.post0
+six==1.17.0
+xlrd==2.0.2
