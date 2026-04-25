@@ -125,8 +125,8 @@ git diff tests/fixtures/                     # review the diff
 │   └── vendors/
 │       ├── __init__.py           # VENDORS registry
 │       └── badger/
-│           ├── parser.py         # PDF text extraction (page 1)
-│           ├── ocr.py            # OCR SHIP TO customer from page 2 BOL
+│           ├── parser.py         # PDF text extraction (page 1, all fields incl. consignee)
+│           ├── ocr.py            # Page-2 BOL OCR — kept for ad-hoc debugging; not on production path
 │           └── rules.py          # Badger business rules + build_bill_entry
 ├── data/
 │   └── hbf-customers.xls         # Customer master list (editable)

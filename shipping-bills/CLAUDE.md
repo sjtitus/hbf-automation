@@ -31,10 +31,7 @@ python3 process_badger.py --dry-run <invoice-dir>
 pip3 install -r requirements.txt
 ```
 
-`hbf_shipping/vendors/badger/ocr.py` shells out to the `tesseract` binary. Install it once per machine:
-```bash
-brew install tesseract
-```
+The production path is page-1 text only — no system binaries required. `hbf_shipping/vendors/badger/ocr.py` is preserved for ad-hoc debugging of page-2 BOLs and shells out to `tesseract` if you exercise it (`brew install tesseract`); it is not invoked by `parse_invoice`.
 
 ## Architecture
 
@@ -53,8 +50,8 @@ hbf_shipping/                          # The package
     __init__.py                        # VENDORS = {'badger': ...}
     badger/
       __init__.py                      # Re-exports parse_invoice, build_bill_entry, REQUIRED_FIELDS, SHIPPING_COMPANY
-      parser.py                        # Page-1 text extraction
-      ocr.py                           # Page-2 BOL SHIP TO OCR (Badger-specific)
+      parser.py                        # Page-1 text extraction (all fields, including consignee)
+      ocr.py                           # Page-2 BOL OCR — preserved for debugging; not on production path
       rules.py                         # Badger business rules (bill-date, due-date, shipper→category)
 data/
   hbf-customers.xls                    # Customer master list (editable)
@@ -95,18 +92,19 @@ Then add the vendor to `hbf_shipping/vendors/__init__.py::VENDORS` and (optional
 
 ### PDF Data Extraction
 
-Page 1 (text-extractable) supplies most fields:
+All fields come from page 1. The parser uses pypdf's plain `extract_text()` for most fields and `extraction_mode='layout'` for the two-column CONSIGNEE block (where layout preserves the column gap so the right column can be split out).
+
 - **Invoice Number**: Top right corner
 - **Invoice Date**: Top right, labeled "DATE"
 - **Ship Date**: Right side, labeled "SHIP DATE"
 - **Shipper**: Left box with vertical "SHIPPER" label
 - **Bill To**: Should be "Highland Beef Farms"
-- **Sales Order (SO) Number**: Format "SO-#####" (or "S0-#####" with OCR-artifact digit-zero)
+- **Consignee/Customer**: Right-hand column under the "CONSIGNEE" header in the layout-mode text. `_extract_page1_consignee` anchors on the line ending in `CONSIGNEE`, takes the next 3 non-empty lines, and splits each on 3+ spaces — the rightmost fragment of the first such line is the consignee name.
+- **Sales Order (SO) Number**: Format "SO-#####". The parser also accepts "S0-#####" (digit-zero) since the page-1 text stream sometimes emits the prefix that way; the value is normalized back to letter-O before use.
 - **Total Amount**: Bottom right, "PLEASE PAY THIS AMOUNT"
 - **Past Due Date**: Bottom left, "THIS BILL IS PAST DUE ON"
 
-Page 2 (image-only BOL) supplies the customer, via OCR in `hbf_shipping/vendors/badger/ocr.py`:
-- **Consignee/Customer**: First text line inside the SHIP TO block on the BOL. The page-1 "CONSIGNEE" field is often abbreviated (e.g. "FCI" → should be "Tucson FCI"), which breaks customer lookup; page 2 has the full name.
+Page-2 BOL OCR was tried earlier (the page-1 consignee can be abbreviated, e.g. "FCI" vs. "Tucson FCI") but was retired because BOL image quality was inconsistent and produced silent wrong matches. `hbf_shipping/vendors/badger/ocr.py` is kept around for ad-hoc debugging only.
 
 ### Customer Validation Logic
 1. Extract the Consignee (customer name) from the invoice
@@ -193,7 +191,7 @@ e.g. `badger-2026-04-25T09-30-45ET-a3f9c1`. Wall-clock US Eastern with literal `
 
 **Inside `logs/<run-id>/`:**
 - `run.log` — INFO+ run-wide log, mirrors stdout.
-- `<invoice-stem>.log` — DEBUG+ log scoped to one invoice, written through a flushing FileHandler so partial output survives a crash. The first place to look when an invoice breaks. Captures parser extractor results, OCR anchor decisions, customer-lookup match tier, business-rule branches, and full exception tracebacks.
+- `<invoice-stem>.log` — DEBUG+ log scoped to one invoice, written through a flushing FileHandler so partial output survives a crash. The first place to look when an invoice breaks. Captures parser extractor results (per-field value or failure reason), customer-lookup match tier, business-rule branches, and full exception tracebacks.
 - `summary.csv` — one row per PDF. Columns: `Run ID, Shipping Company, Invoice File, Processing Start, Processing End, Status, Bill Number, SO Number, Consignee, Customer Matched, Total Amount, Log File, Fail Step, Fail Message, Fail Detail`. Status is `SUCCESS` or `FAIL`; the extracted fields (Bill Number, SO Number, Consignee, Customer Matched, Total Amount) are populated on a best-effort basis even on FAIL. `Log File` points to the per-invoice log so triage can jump from a CSV row to its debug detail. On `FAIL`, `Fail Step` identifies where the failure occurred (`parse_pdf`, `validate_fields`, `customer_lookup`, or `build_bill_entry`); `Fail Detail` carries the specific extractor reason for `validate_fields` failures (e.g. "no match for pattern 'S[O0]-<digits>'"); otherwise `N/A`.
 - `manifest.json` — machine-readable index of artifacts (run id, vendor, totals, paths to per-invoice logs, bills CSV, summary CSV). Future cloud worker uses this as the job-result document.
 
