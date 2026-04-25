@@ -1,10 +1,16 @@
 """
 PDF Parser for Badger State Western invoices.
-Extracts structured data from Badger invoice PDFs.
 
-Most fields come from page 1 (text-extractable). The consignee (customer)
-comes from page 2 via OCR of the BOL SHIP TO block — see bol_ocr.py —
-because page 1's consignee is often abbreviated or ambiguous.
+All fields are extracted from page-1 text. The consignee comes from the
+page-1 two-column CONSIGNEE block (parsed via pypdf's
+`extraction_mode='layout'` to preserve the column gap between the SHIPPER
+column and the CONSIGNEE column).
+
+OCR of the page-2 BOL is intentionally NOT used here — page-2 image
+quality is inconsistent across Badger's BOL templates and produces noisy
+results that have led to silent wrong matches in the past. The OCR
+machinery is preserved in `ocr.py` (and is still importable for ad-hoc
+debugging) but the production path stays page-1-only.
 
 Every _extract_* method returns (value, reason):
     - value is the extracted value, or None on failure
@@ -18,8 +24,6 @@ import logging
 import re
 from datetime import datetime
 from pypdf import PdfReader
-
-from .ocr import extract_ship_to_customer
 
 
 logger = logging.getLogger(__name__)
@@ -104,14 +108,54 @@ class BadgerInvoiceParser:
         return None, f"no known shipper matched (looked for {shippers}); SHIPPER-block fallback also failed"
 
     def _extract_consignee(self, text):
-        """Consignee comes from the page-2 BOL SHIP TO block (OCR).
+        """Pull the consignee name from the page-1 CONSIGNEE column.
 
-        The page-1 "CONSIGNEE" field on Badger invoices is often abbreviated
-        (e.g. "FCI" instead of "Tucson FCI"), which breaks customer lookup.
-        OCR of the BOL on page 2 gives the fully-qualified name that HBF
-        uses as the customer.
+        Returns just the name (the address from `_extract_page1_consignee`
+        is parsed but not surfaced — kept available for future use).
         """
-        return extract_ship_to_customer(self.pdf_path)
+        name, _addr, reason = self._extract_page1_consignee()
+        return name, reason
+
+    def _extract_page1_consignee(self):
+        """Pull consignee name + address lines from the page-1 two-column block.
+
+        Layout: pypdf's `extraction_mode='layout'` preserves the column gap
+        between the SHIPPER block (left) and the CONSIGNEE block (right).
+        We anchor on the line that ends with the literal "CONSIGNEE" header,
+        then take the next 3 non-empty lines and split each at 3+ whitespace
+        runs; the rightmost fragment is the consignee column.
+
+        Returns (name, address_lines, reason). On any layout surprise,
+        returns (None, None, reason).
+        """
+        layout_text = self.reader.pages[0].extract_text(extraction_mode='layout')
+        lines = layout_text.splitlines()
+
+        header_idx = None
+        for i, line in enumerate(lines):
+            if line.rstrip().endswith('CONSIGNEE'):
+                header_idx = i
+                break
+        if header_idx is None:
+            return None, None, "no line ending in 'CONSIGNEE' found in layout text"
+
+        block = []
+        for line in lines[header_idx + 1:]:
+            if line.strip():
+                block.append(line)
+                if len(block) >= 3:
+                    break
+        if len(block) < 3:
+            return None, None, f"only {len(block)} non-empty lines after CONSIGNEE header (need 3)"
+
+        right_col = []
+        for line in block:
+            parts = re.split(r'\s{3,}', line.strip())
+            if not parts or not parts[-1].strip():
+                return None, None, f"could not extract right column from {line!r}"
+            right_col.append(parts[-1].strip())
+
+        return right_col[0], right_col[1:], None
 
     def _extract_so_number(self, text):
         """Extract sales order number — accepts 'SO-' or 'S0-' (OCR artifact).

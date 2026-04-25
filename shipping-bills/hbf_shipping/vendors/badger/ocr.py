@@ -56,7 +56,18 @@ _NEG_TOKENS_RE   = re.compile(
 # Left-column crop: SHIP FROM / SHIP TO / Third Party Bill To all live in
 # the left half of the BOL. Right side is Carrier/Trailer info, which we
 # actively want to exclude to avoid column crossover in OCR output.
-_LEFT_COLUMN_CROP = (0, 0, 1050, 1400)
+# Vertical extent is generous (0..1500) so we catch SHIP TO content for
+# BOLs where the SHIP FROM block runs longer than usual; downstream code
+# uses the SHIP TO label as an anchor so noise above/below is filtered out.
+_LEFT_COLUMN_CROP = (0, 0, 1280, 1500)
+
+# Tokens that mark the end of the SHIP TO block — anything below these
+# is third-party bill-to, freight-charges, special instructions, etc.,
+# which is not part of the consignee.
+_SHIP_TO_END_RE = re.compile(
+    r'(FREIGHT|THIRD\s*PARTY|BILL\s*TO|Highland\s*Beef|Special\s*Instructions)',
+    re.IGNORECASE,
+)
 
 
 def extract_ship_to_customer(pdf_path: str | Path) -> tuple[str | None, str | None]:
@@ -84,6 +95,30 @@ def extract_ship_to_customer(pdf_path: str | Path) -> tuple[str | None, str | No
         return None, "OCR ran but no SHIP TO anchor (label, shipper-block, or 'Highland Beef Farms') resolved to a customer-name line"
     logger.debug("ship_to customer -> %r", name)
     return name, None
+
+
+def extract_ship_to_block(pdf_path: str | Path) -> tuple[list[str] | None, str | None]:
+    """Return all cleaned non-empty OCR lines from the wide left-column crop.
+
+    No SHIP TO localization is attempted here — the caller (parser's hybrid
+    consignee logic) does a token-overlap check against the page-1 address
+    to decide whether the OCR is "about the same place" as page-1. That's
+    more robust than guessing where the SHIP TO block starts/ends in noisy
+    OCR output.
+
+    Returns (lines, reason); lines is None on image-load failure.
+    """
+    pdf_path = Path(pdf_path)
+    try:
+        image = _load_bol_image(pdf_path)
+    except _BolImageError as e:
+        logger.debug("BOL image load failed: %s", e)
+        return None, str(e)
+
+    text = _ocr_left_column(image)
+    lines = [_clean_line(ln) for ln in text.splitlines() if _clean_line(ln)]
+    logger.debug("ship_to_block: %d cleaned lines from full crop", len(lines))
+    return lines, None
 
 
 class _BolImageError(Exception):
@@ -143,6 +178,16 @@ def _looks_like_company(line: str) -> bool:
     if not s:
         return False
     if len(re.findall(r'[A-Za-z]', s)) < 3:
+        return False
+    # Real customer names are short — 1 to 5 tokens. Long sentences with
+    # many tokens are almost always OCR garbage (mangled label rows or
+    # special-instructions blurbs); reject them outright.
+    tokens = s.split()
+    if len(tokens) > 6:
+        return False
+    # Reject lines with too many short fragments (≤2 chars) — typical of
+    # OCR noise like "SUE SARS Ae oT SED SHIR TO eS".
+    if sum(1 for t in tokens if len(t) <= 2) > 1:
         return False
     if _STREET_RE.match(s):         return False
     if _PHONE_RE.search(s):         return False
