@@ -77,6 +77,33 @@ Each run creates `logs/<vendor>-YYYY-MM-DDTHH-MM-SSET-XXXXXX/` containing:
 - ☐ Scotlyn (planned)
 - ☐ MRS (planned)
 
+## Running tests
+
+The project has a regression test suite that runs the pipeline end-to-end against real invoice PDFs and compares the output against committed *golden* JSON files.
+
+```bash
+pip install -r requirements-dev.txt    # one-time, pulls pytest
+pytest                                  # runs all regressions
+pytest -k badger                        # one vendor only
+```
+
+Test PDFs live under `tests/fixtures/<vendor>/` and are gitignored (they contain real customer data). Goldens live alongside as `<stem>.expected.json` and are also gitignored. Both stay on each developer's local disk.
+
+**Adding a new test case:**
+```bash
+cp /path/to/invoice.pdf tests/fixtures/badger/
+python3 tools/refresh_goldens.py badger      # captures the golden
+pytest -k badger                              # confirm it passes
+```
+
+**After an intentional pipeline change:**
+```bash
+python3 tools/refresh_goldens.py             # regenerate ALL goldens
+git diff tests/fixtures/                     # review the diff
+# Goldens are gitignored, but the diff command shows working-tree changes
+# so you can sanity-check that the change is what you expected.
+```
+
 ## Next Steps
 
 1. Email monitoring (Outlook Graph API or folder watch)
@@ -106,6 +133,13 @@ Each run creates `logs/<vendor>-YYYY-MM-DDTHH-MM-SSET-XXXXXX/` containing:
 ├── badger-invoices/              # Drop-zone for invoice PDFs to process
 ├── quickbooks-imports/           # Generated batch-bills CSVs (one per run)
 ├── logs/                         # Per-run dirs: run.log, per-invoice .log, summary.csv, manifest.json
+├── tests/
+│   ├── test_vendor_regression.py # Parametrized end-to-end regression test
+│   └── fixtures/<vendor>/        # Test PDFs + .expected.json goldens (gitignored)
+├── tools/
+│   └── refresh_goldens.py        # (Re)generate goldens for one or all PDFs
+├── pytest.ini
+├── requirements-dev.txt          # Adds pytest for the test suite
 └── venv/                         # Python virtual environment
 ```
 

@@ -23,6 +23,12 @@ scotlyn-invoices/*
 mrs-invoices/*
 !mrs-invoices/.gitkeep
 
+# --- Sensitive: test fixtures ---
+# PDFs and golden outputs reference real customer data — track only the
+# .gitkeep so the directory layout exists after a fresh clone.
+tests/fixtures/*
+!tests/fixtures/.gitkeep
+
 # --- Generated runtime artifacts ---
 logs/
 quickbooks-imports/

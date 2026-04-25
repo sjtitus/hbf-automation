@@ -165,6 +165,20 @@ From the example PDF `Badger-example-Invoice0064452.pdf`:
 
 ## Development Notes
 
+### Testing
+
+Regression test suite under `tests/`. Pattern: end-to-end golden-file comparison — each test PDF in `tests/fixtures/<vendor>/` has a paired `<stem>.expected.json` snapshot of the full pipeline output (parsed `invoice_data`, `customer_matched`, and `bill_entry`). pytest parametrizes one test case per fixture pair.
+
+```bash
+pip install -r requirements-dev.txt
+pytest                              # all
+pytest -k badger                    # one vendor
+python3 tools/refresh_goldens.py    # regenerate goldens (review diff before committing)
+python3 tools/refresh_goldens.py badger 0064452   # one PDF only
+```
+
+PDFs and goldens are gitignored (real customer data). The harness scales to additional vendors with zero code changes — drop PDFs into `tests/fixtures/<vendor>/`, refresh goldens, run pytest.
+
 ### Execution modes
 
 - **default** — parse + business rules, print a CSV-field preview, and write `quickbooks-imports/bills-<vendor>-YYYYMMDD-HHMMSS.csv`.
