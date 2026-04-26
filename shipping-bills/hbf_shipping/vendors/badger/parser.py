@@ -29,6 +29,11 @@ from pypdf import PdfReader
 logger = logging.getLogger(__name__)
 
 
+_CSZ_RE = re.compile(
+    r'^(?P<city>.+?),\s+(?P<state>[A-Za-z]{2})\s+(?P<postcode>\d{5}(?:-\d{4})?)\s*$'
+)
+
+
 class BadgerInvoiceParser:
     """Parses Badger State Western invoice PDFs."""
 
@@ -36,6 +41,7 @@ class BadgerInvoiceParser:
         self.pdf_path = pdf_path
         self.reader = PdfReader(pdf_path)
         self.first_page_text = self.reader.pages[0].extract_text()
+        self._consignee_cache = None
 
     def parse(self):
         """Extract invoice data. Returns (data, reasons) — dicts keyed by field name.
@@ -46,14 +52,19 @@ class BadgerInvoiceParser:
         text = self.first_page_text
         logger.debug("page-1 text length=%d chars", len(text))
         extractors = {
-            'invoice_number': self._extract_invoice_number,
-            'invoice_date':   self._extract_invoice_date,
-            'ship_date':      self._extract_ship_date,
-            'shipper':        self._extract_shipper,
-            'consignee':      self._extract_consignee,
-            'so_number':      self._extract_so_number,
-            'total_amount':   self._extract_total_amount,
-            'past_due_date':  self._extract_past_due_date,
+            'invoice_number':            self._extract_invoice_number,
+            'invoice_date':              self._extract_invoice_date,
+            'ship_date':                 self._extract_ship_date,
+            'shipper':                   self._extract_shipper,
+            'consignee':                 self._extract_consignee,
+            'consignee_address_line_1':  self._extract_consignee_address_line_1,
+            'consignee_address_line_2':  self._extract_consignee_address_line_2,
+            'consignee_city':            self._extract_consignee_city,
+            'consignee_state':           self._extract_consignee_state,
+            'consignee_postcode':        self._extract_consignee_postcode,
+            'so_number':                 self._extract_so_number,
+            'total_amount':              self._extract_total_amount,
+            'past_due_date':             self._extract_past_due_date,
         }
         data, reasons = {}, {}
         for field, fn in extractors.items():
@@ -108,26 +119,47 @@ class BadgerInvoiceParser:
         return None, f"no known shipper matched (looked for {shippers}); SHIPPER-block fallback also failed"
 
     def _extract_consignee(self, text):
-        """Pull the consignee name from the page-1 CONSIGNEE column.
+        """Consignee name (right-column row 0)."""
+        return self._consignee_block()['name']
 
-        Returns just the name (the address from `_extract_page1_consignee`
-        is parsed but not surfaced — kept available for future use).
+    def _extract_consignee_address_line_1(self, text):
+        return self._consignee_block()['address_line_1']
+
+    def _extract_consignee_address_line_2(self, text):
+        return self._consignee_block()['address_line_2']
+
+    def _extract_consignee_city(self, text):
+        return self._consignee_block()['city']
+
+    def _extract_consignee_state(self, text):
+        return self._consignee_block()['state']
+
+    def _extract_consignee_postcode(self, text):
+        return self._consignee_block()['postcode']
+
+    def _consignee_block(self):
+        """Cached parse of the page-1 right-column CONSIGNEE block.
+
+        Returns a dict with keys: name, address_line_1, address_line_2,
+        city, state, postcode. Each value is a (value, reason) pair —
+        value is None on failure with a reason string, otherwise reason is None.
+
+        Strategy: anchor on the line ending in 'CONSIGNEE'. Walk forward,
+        splitting each non-empty line at 3+ whitespace runs and taking the
+        rightmost fragment as the consignee column. Stop at the first line
+        matching `<city>, <ST> <ZIP>` (the CSZ line). Lines between the
+        name (row 0) and the CSZ line are address lines.
         """
-        name, _addr, reason = self._extract_page1_consignee()
-        return name, reason
+        if self._consignee_cache is not None:
+            return self._consignee_cache
 
-    def _extract_page1_consignee(self):
-        """Pull consignee name + address lines from the page-1 two-column block.
+        def all_failed(reason):
+            return {
+                k: (None, reason) for k in
+                ('name', 'address_line_1', 'address_line_2',
+                 'city', 'state', 'postcode')
+            }
 
-        Layout: pypdf's `extraction_mode='layout'` preserves the column gap
-        between the SHIPPER block (left) and the CONSIGNEE block (right).
-        We anchor on the line that ends with the literal "CONSIGNEE" header,
-        then take the next 3 non-empty lines and split each at 3+ whitespace
-        runs; the rightmost fragment is the consignee column.
-
-        Returns (name, address_lines, reason). On any layout surprise,
-        returns (None, None, reason).
-        """
         layout_text = self.reader.pages[0].extract_text(extraction_mode='layout')
         lines = layout_text.splitlines()
 
@@ -137,25 +169,58 @@ class BadgerInvoiceParser:
                 header_idx = i
                 break
         if header_idx is None:
-            return None, None, "no line ending in 'CONSIGNEE' found in layout text"
-
-        block = []
-        for line in lines[header_idx + 1:]:
-            if line.strip():
-                block.append(line)
-                if len(block) >= 3:
-                    break
-        if len(block) < 3:
-            return None, None, f"only {len(block)} non-empty lines after CONSIGNEE header (need 3)"
+            self._consignee_cache = all_failed(
+                "no line ending in 'CONSIGNEE' found in layout text")
+            return self._consignee_cache
 
         right_col = []
-        for line in block:
+        csz_match = None
+        for line in lines[header_idx + 1:]:
+            if not line.strip():
+                continue
             parts = re.split(r'\s{3,}', line.strip())
             if not parts or not parts[-1].strip():
-                return None, None, f"could not extract right column from {line!r}"
-            right_col.append(parts[-1].strip())
+                self._consignee_cache = all_failed(
+                    f"could not extract right column from {line!r}")
+                return self._consignee_cache
+            col_text = parts[-1].strip()
+            right_col.append(col_text)
+            m = _CSZ_RE.match(col_text)
+            if m:
+                csz_match = m
+                break
+            if len(right_col) > 6:
+                self._consignee_cache = all_failed(
+                    "scanned >6 lines past CONSIGNEE without finding city/state/zip")
+                return self._consignee_cache
 
-        return right_col[0], right_col[1:], None
+        if csz_match is None:
+            self._consignee_cache = all_failed(
+                "no city/state/zip line found in consignee block")
+            return self._consignee_cache
+        if len(right_col) < 2:
+            self._consignee_cache = all_failed(
+                "consignee block has CSZ but no name line")
+            return self._consignee_cache
+
+        # right_col[0] = name; right_col[-1] = CSZ line; the rest = address lines
+        name = right_col[0]
+        addr_lines = right_col[1:-1]
+        line_1 = addr_lines[0] if addr_lines else None
+        line_2 = addr_lines[1] if len(addr_lines) > 1 else None
+
+        self._consignee_cache = {
+            'name': (name, None),
+            'address_line_1': (
+                line_1,
+                None if line_1 else "no address line found between name and city/state/zip",
+            ),
+            'address_line_2': (line_2, None),  # legitimately None for short addresses
+            'city':     (csz_match.group('city').strip(), None),
+            'state':    (csz_match.group('state').upper(), None),
+            'postcode': (csz_match.group('postcode'), None),
+        }
+        return self._consignee_cache
 
     def _extract_so_number(self, text):
         """Extract sales order number — accepts 'SO-' or 'S0-' (OCR artifact).

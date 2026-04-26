@@ -21,7 +21,10 @@ from pathlib import Path
 
 from .bill_entry import BillEntry
 from .csv_export import format_bills_preview, write_bills_csv
-from .customer_lookup import CustomerValidator
+from .customer_address_map import (
+    load_address_to_customers,
+    lookup_with_name_fallback,
+)
 from .processing_log import write_processing_log
 from .run_logging import invoice_logger, write_manifest
 
@@ -40,7 +43,7 @@ class Pipeline:
         self.run_id = run_id
         self.run_dir = run_dir
         self.dry_run = dry_run
-        self.customer_validator = CustomerValidator()
+        self.address_map = load_address_to_customers()
         self.collected_entries: list[BillEntry] = []
         self.processing_log_rows: list[dict] = []
         self.invoice_log_paths: list[Path] = []
@@ -66,8 +69,16 @@ class Pipeline:
             'bill_number': None,
             'so_number': None,
             'consignee': None,
-            'customer_matched': None,
             'total_amount': None,
+            'pdf_address': '',
+            'cm_method': '',
+            'cm_score': '',
+            'cm_count': 0,
+            'cm_matched': '',
+            'cm_near_miss': '',
+            'cm_near_miss_score': '',
+            'name_method': '',
+            'name_score': '',
         }
 
         with invoice_logger(self.run_dir, pdf_path.stem) as log_path:
@@ -84,7 +95,20 @@ class Pipeline:
                     'Bill Number': ctx['bill_number'] or 'N/A',
                     'SO Number': ctx['so_number'] or 'N/A',
                     'Consignee': ctx['consignee'] or 'N/A',
-                    'Customer Matched': ctx['customer_matched'] or 'N/A',
+                    'CustomerMatch: PDF Address': ctx['pdf_address'] or 'N/A',
+                    'CustomerMatch: Method': ctx['cm_method'] or 'N/A',
+                    'CustomerMatch: Score': ctx['cm_score'] if ctx['cm_score'] != '' else 'N/A',
+                    'CustomerMatch: Count': ctx['cm_count'],
+                    'CustomerMatch: Matched': ctx['cm_matched'] or 'N/A',
+                    'CustomerMatch: Near Miss': ctx['cm_near_miss'] or 'N/A',
+                    'CustomerMatch: Near Miss Score': (
+                        ctx['cm_near_miss_score']
+                        if ctx['cm_near_miss_score'] != '' else 'N/A'
+                    ),
+                    'NameMatch: Method': ctx['name_method'] or 'N/A',
+                    'NameMatch: Score': (
+                        ctx['name_score'] if ctx['name_score'] != '' else 'N/A'
+                    ),
                     'Total Amount': (
                         f"{ctx['total_amount']:.2f}"
                         if ctx['total_amount'] is not None else 'N/A'
@@ -111,6 +135,13 @@ class Pipeline:
                 ctx['consignee'] = invoice_data.get('consignee')
                 ctx['total_amount'] = invoice_data.get('total_amount')
 
+                al1   = invoice_data.get('consignee_address_line_1')
+                city  = invoice_data.get('consignee_city')
+                state = invoice_data.get('consignee_state')
+                pc    = invoice_data.get('consignee_postcode')
+                if al1 and city and state and pc:
+                    ctx['pdf_address'] = f"{al1}, {city}, {state} {pc}"
+
                 current_step = 'validate_fields'
                 missing = self._validate(invoice_data)
                 if missing is not None:
@@ -127,27 +158,64 @@ class Pipeline:
                 logger.info(f"  ✓ Amount: ${invoice_data['total_amount']:,.2f}")
 
                 current_step = 'customer_lookup'
-                logger.info("\nStep 2: Validating customer...")
-                validation_result = self.customer_validator.validate_customer(
-                    invoice_data['consignee']
+                logger.info("\nStep 2: Looking up customer by address (with name fallback)...")
+                result = lookup_with_name_fallback(
+                    self.address_map,
+                    invoice_data['consignee'],
+                    al1, city, state, pc,
                 )
-                logger.info(f"  {validation_result['message']}")
+                n = len(result.pairs)
+                ctx['cm_method']    = result.cm_method
+                ctx['cm_score']     = result.addr_score
+                ctx['cm_count']     = n
+                ctx['name_method']  = result.name_method
+                ctx['name_score']   = (
+                    result.name_score if result.name_method != 'n/a' else ''
+                )
+                logger.info(
+                    f"  lookup → cm_method={result.cm_method} addr_score={result.addr_score} "
+                    f"count={n} name_method={result.name_method} name_score={result.name_score}"
+                )
 
-                if validation_result['is_distributor']:
-                    logger.warning("\n⚠ DISTRIBUTOR INVOICE - SKIPPING")
-                    logger.warning("This invoice requires SO lookup (not implemented in this workflow)")
-                    message = (
-                        f"Distributor case: consignee '{invoice_data['consignee']}' "
-                        "not in customer master list"
+                if result.cm_method == 'no_match':
+                    near_miss_name = result.pairs[0][1].name if result.pairs else ''
+                    near_miss_score = (
+                        result.name_score if result.name_method == 'tried_failed'
+                        and result.name_score >= result.addr_score
+                        else result.addr_score
                     )
+                    ctx['cm_near_miss'] = near_miss_name
+                    ctx['cm_near_miss_score'] = near_miss_score
+                    message = (
+                        f"No customer match (best near-miss: "
+                        f"{near_miss_name or 'none'} at score {near_miss_score})"
+                    )
+                    logger.warning(f"  {message}")
                     _record('FAIL', current_step, message)
                     return False
 
-                ctx['customer_matched'] = validation_result['matched_name']
+                # Match (or unresolved multi-match) — populate the matched column.
+                matched_names = [p[1].name for p in result.pairs]
+                ctx['cm_matched'] = ' | '.join(matched_names)
+                logger.info(f"  matched: {ctx['cm_matched']}")
+
+                if result.cm_method == 'multi_match_unresolved':
+                    detail = (
+                        "name disambiguation skipped (generic consignee)"
+                        if result.name_method == 'n/a'
+                        else f"name disambiguation tried but failed (best score {result.name_score})"
+                    )
+                    message = f"Multiple customers matched ({n}) — {detail}"
+                    logger.warning(f"  {message}")
+                    _record('FAIL', current_step, message)
+                    return False
+
+                # Exactly one match — proceed to bill entry.
+                customer_name = result.pairs[0][1].name
 
                 current_step = 'build_bill_entry'
                 logger.info("\nStep 3: Preparing bill entry...")
-                entry = self.vendor.build_bill_entry(invoice_data, ctx['customer_matched'])
+                entry = self.vendor.build_bill_entry(invoice_data, customer_name)
 
                 self.collected_entries.append(entry)
                 logger.info("✓ Invoice ready")

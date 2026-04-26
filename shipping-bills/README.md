@@ -41,21 +41,22 @@ directory.
 
 ## Local-only data (not in this repo)
 
-Two things are needed at runtime but are intentionally **not** committed:
+Three things are needed at runtime but are intentionally **not** committed:
 
-1. **`data/hbf-customers.xls`** — the master customer list (business-confidential). Obtain from the company's secure share and place it in `data/`. The directory is committed (with a `.gitkeep` placeholder); the spreadsheet is gitignored.
-2. **`badger-invoices/*.pdf`** — production invoice PDFs you want to process. Drop them into `badger-invoices/` (or pass a different directory on the command line). The directory is committed; PDFs are gitignored.
+1. **`data/hbf-customer-shipping-addresses.xlsx`** — the address-keyed customer master (one row per customer-address pairing; columns `Name | AddressLine1 | AddressLine2 | City | State | Postcode`). Used by the production address-aware lookup. Business-confidential; obtain from the company's secure share.
+2. **`data/hbf-customers.xls`** — legacy name-only customer list. Used today only by the regression tests' golden-comparison harness. Same placement / handling.
+3. **`badger-invoices/*.pdf`** — production invoice PDFs you want to process. Drop them into `badger-invoices/` (or pass a different directory on the command line). The directory is committed; PDFs are gitignored.
 
 Per-run output (`logs/<run-id>/`, `quickbooks-imports/bills-<run-id>.csv`) is also gitignored — these contain customer data and regenerate on every run.
 
 ## What it does
 
 ✓ **It DOES:**
-- Parse PDF invoices and extract all relevant data
-- Validate customers against the customer list
+- Parse PDF invoices and extract all relevant data (incl. structured consignee address)
+- Match the consignee against the customer master by address (USPS Pub 28 normalization via `usaddress-scourgify`, fuzzy fallback within the `(city, state, postcode)` bucket via `rapidfuzz`), with a 4-tier name fallback / disambiguator when address alone isn't decisive
 - Apply all business rules for QuickBooks entry
 - Write a QuickBooks batch-bills CSV (or preview it with `--dry-run`)
-- Produce a self-contained per-run artifact directory under `./logs/<run-id>/` containing a run log, per-invoice debug logs, a summary CSV, and a manifest
+- Produce a self-contained per-run artifact directory under `./logs/<run-id>/` containing a run log, per-invoice debug logs, a 23-column summary CSV (with `CustomerMatch:` and `NameMatch:` column groups capturing how each match was reached), and a manifest
 
 ✗ **It DOES NOT:**
 - Connect to Outlook email
@@ -118,18 +119,20 @@ git diff tests/fixtures/                     # review the diff
 │   ├── cli.py                    # Argument parsing + vendor dispatch
 │   ├── pipeline.py               # Vendor-agnostic processing pipeline
 │   ├── bill_entry.py             # Shared BillEntry dataclass
-│   ├── customer_lookup.py        # Customer validation
+│   ├── customer_address_map.py   # Address-aware customer lookup (production path)
+│   ├── customer_lookup.py        # Legacy name-only validator (test/golden path only)
 │   ├── csv_export.py             # CSV writer + dry-run preview
-│   ├── processing_log.py         # Per-invoice summary CSV writer
+│   ├── processing_log.py         # Per-invoice summary CSV writer (23 cols)
 │   ├── run_logging.py            # Per-run log dir + per-invoice log handler + manifest
 │   └── vendors/
 │       ├── __init__.py           # VENDORS registry
 │       └── badger/
-│           ├── parser.py         # PDF text extraction (page 1, all fields incl. consignee)
+│           ├── parser.py         # PDF text extraction (page 1, all fields incl. structured address)
 │           ├── ocr.py            # Page-2 BOL OCR — kept for ad-hoc debugging; not on production path
 │           └── rules.py          # Badger business rules + build_bill_entry
 ├── data/
-│   └── hbf-customers.xls         # Customer master list (editable)
+│   ├── hbf-customer-shipping-addresses.xlsx  # Production address-keyed master
+│   └── hbf-customers.xls         # Legacy name-only master (regression tests only)
 ├── badger-invoices/              # Drop-zone for invoice PDFs to process
 ├── quickbooks-imports/           # Generated batch-bills CSVs (one per run)
 ├── logs/                         # Per-run dirs: run.log, per-invoice .log, summary.csv, manifest.json
@@ -137,7 +140,9 @@ git diff tests/fixtures/                     # review the diff
 │   ├── test_vendor_regression.py # Parametrized end-to-end regression test
 │   └── fixtures/<vendor>/        # Test PDFs + .expected.json goldens (gitignored)
 ├── tools/
-│   └── refresh_goldens.py        # (Re)generate goldens for one or all PDFs
+│   ├── refresh_goldens.py        # (Re)generate goldens for one or all PDFs
+│   ├── dump_customer_addresses.py# Eyeball dump of the customer-address map
+│   └── match_consignees.py       # Run parser+lookup over fixture PDFs, print outcomes
 ├── pytest.ini
 ├── requirements-dev.txt          # Adds pytest for the test suite
 └── venv/                         # Python virtual environment
