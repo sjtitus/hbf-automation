@@ -37,9 +37,10 @@ from typing import Optional
 import cv2
 import numpy as np
 import pytesseract
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process as rf_process
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from crop_ship_to import (  # noqa: E402
     render_pdf_page, crop_to_document, _binarize, _ocr_pass,
 )
@@ -47,6 +48,9 @@ from find_ship_to_bounds import (  # noqa: E402
     ocr_lines_with_sparse, find_anchor_signals, find_header_fallback,
     _aggregate, _line_text,
     UPPER_TARGET, LOWER_TARGET, DEFAULT_FUZZ_THRESHOLD, HEADER_PAD_PX,
+)
+from hbf_shipping.customer_address_map import (  # noqa: E402
+    load_address_to_customers, lookup_by_address, _norm,
 )
 
 
@@ -91,7 +95,7 @@ class ExtractConfig:
     roi_pad_right: int = 60
 
     # --- PSM-duplicate dedupe (collapse same-row OCR variants) ---
-    psm_dup_text_sim: int = 75            # token_set_ratio threshold
+    psm_dup_text_sim: int = 75              # token_set_ratio threshold
     cluster_min_text_len_frac: float = 0.8  # within-cluster length filter
 
     # --- Stride-up walker ---
@@ -109,6 +113,15 @@ class ExtractConfig:
     # --- Address content classifier ---
     min_alnum_for_content: int = 3
     address_word_min_len: int = 5
+
+    # --- Customer-list validation (line 1) ---
+    # Optional. When set, the captured top line of every address is fuzzy-
+    # matched against the customer master (data/hbf-customer-shipping-
+    # addresses.xlsx). Currently OBSERVATION ONLY -- the validator reports
+    # match outcomes per fixture but never disqualifies a captured line.
+    customer_master_path: Optional[Path] = None
+    customer_match_top_threshold: int = 88   # min WRatio for the top match
+    customer_match_gap_threshold: int = 10   # min (top - second) for uniqueness
 
 
 DEFAULT_CONFIG = ExtractConfig()
@@ -558,9 +571,105 @@ def annotate(img: np.ndarray, mid_y: int, lower_y: int, upper_y: int,
     return out
 
 
+# ---------- Customer-list validation (line 1) ----------
+# Leading/trailing junk chars stripped from the OCR'd line 1 before
+# matching. Captures all the noise we've seen across the 14 fixtures:
+# pipes from column gutter, punctuation from page artifacts, brackets,
+# stray quotes.
+_LINE1_STRIP_CHARS = "|:'\",.;_~-{}()`* \t"
+
+
+def clean_line_1_for_match(text: str) -> str:
+    """Apply the same normalization to an OCR'd line 1 as the master
+    file's line_1_clean: strip leading/trailing OCR junk, then upper +
+    single-space via the same _norm() the master uses. Without this,
+    '| Salinas Valley State Prison' wouldn't match 'SALINAS VALLEY
+    STATE PRISON' from line_1_clean even though they're the same."""
+    return _norm(text.strip(_LINE1_STRIP_CHARS))
+
+
+_STREET_DIGIT_RE = re.compile(r"^\s*\d+")
+_STREET_POBOX_RE = re.compile(r"^\s*p\.?\s*o\.?\s*box\b", re.IGNORECASE)
+
+
+def parse_street_from_address_lines(address_lines: list[dict],
+                                    csz_line: dict) -> Optional[str]:
+    """From the captured address lines, pick the line that looks like a
+    street and return its cleaned text. Heuristic: leading digit (street
+    number, e.g. '1000 Vaughn Rd.') or 'P.O. Box ...' pattern. Excludes
+    the CSZ line itself (which also starts with a digit on PO Box-only
+    addresses but is the city-state-zip). Among matches, prefer the one
+    closest to (just above) CSZ."""
+    candidates: list[tuple[int, str]] = []
+    for ln in address_lines:
+        if ln is csz_line:
+            continue
+        text = clean_line_1_for_match(_line_text(ln))
+        if not text:
+            continue
+        if _STREET_DIGIT_RE.match(text) or _STREET_POBOX_RE.match(text):
+            candidates.append((ln["y_top"], text))
+    if not candidates:
+        return None
+    # Highest y_top = closest to CSZ
+    candidates.sort(key=lambda c: c[0])
+    return candidates[-1][1]
+
+
+def validate_against_master(line_1_text: str, address_lines: list[dict],
+                            csz_line: dict, addr_map: dict,
+                            cfg: ExtractConfig) -> dict:
+    """Address-driven validation. Use the parsed street + extracted CSZ
+    to look up the customer in the master, then check the captured line 1
+    against the customer's expected line_1_clean. Observation only.
+    """
+    cleaned_line_1 = clean_line_1_for_match(line_1_text)
+    street = parse_street_from_address_lines(address_lines, csz_line)
+    if street is None:
+        return {
+            "cleaned_line_1": cleaned_line_1, "street": None,
+            "method": "no_street_parsed", "n_pairs": 0,
+            "pair_line_1s": [], "best_pair": None, "best_score": 0,
+            "is_unique": False,
+        }
+
+    result = lookup_by_address(addr_map, street,
+                               csz_line["csz_city"],
+                               csz_line["csz_state"],
+                               csz_line["csz_zip"])
+    pair_line_1s = [e.line_1_clean for _, e in result.pairs if e.line_1_clean]
+
+    best_pair = None
+    best_score = 0
+    if pair_line_1s and cleaned_line_1:
+        scored = [(p, int(fuzz.WRatio(cleaned_line_1, p))) for p in pair_line_1s]
+        scored.sort(key=lambda s: s[1], reverse=True)
+        best_pair, best_score = scored[0]
+
+    is_unique = (
+        result.cm_method.startswith("address_")
+        and len(result.pairs) == 1
+        and best_score >= cfg.customer_match_top_threshold
+    )
+
+    return {
+        "cleaned_line_1": cleaned_line_1,
+        "street": street,
+        "method": result.cm_method,
+        "address_score": result.addr_score,
+        "n_pairs": len(result.pairs),
+        "pair_line_1s": pair_line_1s,
+        "best_pair": best_pair,
+        "best_score": best_score,
+        "is_unique": is_unique,
+    }
+
+
 # ---------- Pipeline ----------
 def process(pdf_path: Path, out_dir: Path,
-            cfg: ExtractConfig = DEFAULT_CONFIG) -> tuple[Optional[Path], str]:
+            cfg: ExtractConfig = DEFAULT_CONFIG,
+            addr_map: Optional[dict] = None,
+            ) -> tuple[Optional[Path], str]:
     img = render_pdf_page(pdf_path, page_index=1, dpi=cfg.dpi)
     img = crop_to_document(img)
     h, w = img.shape[:2]
@@ -629,7 +738,23 @@ def process(pdf_path: Path, out_dir: Path,
                  for i, ln in enumerate(address)]
     summary = (f"CSZ {csz['csz_city']!r}, {csz['csz_state']} {csz['csz_zip']}  "
                f"({len(address)} address lines, stop: {stop_reason})")
-    return out_path, summary + "\n" + "\n".join(line_strs) + "\n" + anchor_str
+
+    # Address-driven master validation (observation only; never disqualifies).
+    validation_str = ""
+    if addr_map is not None and address and csz is not None:
+        line_1_text = _line_text(address[0])
+        v = validate_against_master(line_1_text, address, csz, addr_map, cfg)
+        unique_tag = "UNIQUE" if v["is_unique"] else "ambiguous"
+        validation_str = (
+            f"\n  ADDRESS LOOKUP  street={v['street']!r}  "
+            f"csz='{csz['csz_city']} {csz['csz_state']} {csz['csz_zip']}'\n"
+            f"     match={v['method']}  n_pairs={v['n_pairs']}  "
+            f"pair_line_1s={v['pair_line_1s']}\n"
+            f"     line_1: ours={v['cleaned_line_1']!r}  "
+            f"best={v['best_pair']!r}({v['best_score']})  -> {unique_tag}"
+        )
+
+    return out_path, summary + "\n" + "\n".join(line_strs) + "\n" + anchor_str + validation_str
 
 
 def _build_config_from_args(args: argparse.Namespace) -> ExtractConfig:
@@ -645,6 +770,9 @@ def _build_config_from_args(args: argparse.Namespace) -> ExtractConfig:
             "max_lines_above_csz": args.max_lines_above_csz,
             "boundary_fuzz": args.boundary_fuzz,
             "psm_dup_text_sim": args.psm_dup_text_sim,
+            "customer_master_path": args.customer_master,
+            "customer_match_top_threshold": args.customer_match_top_threshold,
+            "customer_match_gap_threshold": args.customer_match_gap_threshold,
         }.items() if v is not None
     }
     return replace(DEFAULT_CONFIG, **overrides) if overrides else DEFAULT_CONFIG
@@ -672,6 +800,17 @@ def main(argv: list[str]) -> int:
                      help="partial_ratio threshold for boundary phrase match")
     cfg.add_argument("--psm-dup-text-sim", type=int, default=None,
                      help="token_set_ratio threshold for PSM-duplicate dedupe")
+    cfg.add_argument("--customer-master", type=Path, default=None,
+                     help="Path to hbf-customer-shipping-addresses.xlsx. If "
+                          "provided, validate captured line 1 against the "
+                          "customer master (observation mode -- never "
+                          "disqualifies a captured line).")
+    cfg.add_argument("--customer-match-top-threshold", type=int, default=None,
+                     help="Min WRatio score for the top customer match "
+                          "(default 88)")
+    cfg.add_argument("--customer-match-gap-threshold", type=int, default=None,
+                     help="Min (top - second) gap to call the match unique "
+                          "(default 10)")
     args = ap.parse_args(argv)
 
     config = _build_config_from_args(args)
@@ -680,10 +819,17 @@ def main(argv: list[str]) -> int:
         shutil.rmtree(args.out_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
+    addr_map: Optional[dict] = None
+    if config.customer_master_path is not None:
+        addr_map = load_address_to_customers(config.customer_master_path)
+        n_pairs = sum(len(v) for v in addr_map.values())
+        print(f"Loaded {len(addr_map)} addresses ({n_pairs} customer entries) "
+              f"from {config.customer_master_path}\n")
+
     ok = 0
     for pdf in args.pdfs:
         try:
-            out_path, note = process(pdf, args.out_dir, config)
+            out_path, note = process(pdf, args.out_dir, config, addr_map)
         except Exception as e:
             print(f"{pdf}: ERROR {e}")
             continue
