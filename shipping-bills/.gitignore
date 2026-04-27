@@ -33,6 +33,11 @@ tests/fixtures/*
 logs/
 quickbooks-imports/
 
+# --- BOL extraction tool outputs (renders of real customer BOLs) ---
+ship_to_crops/
+ship_to_crops_loose/
+shipto_bounds/
+
 # --- Misc legacy / secrets ---
 .qb-browser-profile/
 .env
