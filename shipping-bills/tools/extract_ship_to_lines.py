@@ -30,6 +30,7 @@ import argparse
 import re
 import shutil
 import sys
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -48,7 +49,63 @@ from find_ship_to_bounds import (  # noqa: E402
 )
 
 
-# ---------- Annotation colors / thickness ----------
+# ============================================================
+# CONFIGURATION
+# All tunable parameters live in ExtractConfig. The CLI exposes the
+# most commonly-adjusted knobs; everything else is overridable in code
+# via dataclasses.replace(DEFAULT_CONFIG, ...). Annotation styling is
+# kept as module constants because it's purely cosmetic.
+# ============================================================
+
+DEFAULT_BOUNDARY_PHRASES: tuple[str, ...] = (
+    "ship to", "ship from", "carrier name",
+    "trailer number", "serial number", "bill of lading number",
+    "bar code",
+)
+
+
+@dataclass(frozen=True)
+class ExtractConfig:
+    # --- Render ---
+    dpi: int = 300
+
+    # --- Bounds detection (passed through to find_ship_to_bounds) ---
+    bounds_fuzz_threshold: int = DEFAULT_FUZZ_THRESHOLD
+
+    # --- ROI (focused OCR window for the SHIP TO area) ---
+    # x_right is computed as `w/2 + roi_pad_right`. Negative values keep
+    # the ROI strictly inside column 1 (avoids right-column noise like
+    # 'Trai', 'Traike') but can truncate column-1 content on wider BOLs.
+    # Cut at exactly w/2 (pad=0) is the current sweet spot.
+    roi_pad_top: int = 50
+    roi_pad_bottom: int = 50
+    roi_pad_right: int = 0
+
+    # --- PSM-duplicate dedupe (collapse same-row OCR variants) ---
+    psm_dup_text_sim: int = 75            # token_set_ratio threshold
+    cluster_min_text_len_frac: float = 0.8  # within-cluster length filter
+
+    # --- Stride-up walker ---
+    max_lines_above_csz: int = 4
+    initial_stride_pad: int = 8     # px added to CSZ height for first stride
+    stride_tolerance_min: int = 15  # px; min half-window for finding next line
+    stride_lock_min: int = 30       # px; lower bound for actual_stride to lock
+    stride_lock_max: int = 60       # px; upper bound
+
+    # --- Boundary phrases (stop walking if hit) ---
+    boundary_phrases: tuple[str, ...] = DEFAULT_BOUNDARY_PHRASES
+    boundary_fuzz: int = 70
+    boundary_min_len_frac: float = 0.7
+
+    # --- Address content classifier ---
+    min_alnum_for_content: int = 3
+    address_word_min_len: int = 5
+
+
+DEFAULT_CONFIG = ExtractConfig()
+
+
+# ---------- Annotation colors / thickness (cosmetic, not configurable) ----------
 RED = (0, 0, 220)
 MID_GREEN = (0, 200, 0)
 CSZ_GREEN = (40, 220, 80)
@@ -61,16 +118,7 @@ FINAL_RECT_THICK = 5
 LINE_THICK = 3
 TEXT_FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-# ---------- ROI ----------
-# Keep the ROI strictly inside column 1. The SHIP TO content lives in
-# the left half of the page; column 2 carries CARRIER NAME / TRAILER /
-# SCAC labels whose OCR fragments ('Tr', 'Trai', 'Traike') were polluting
-# the walker. ROI_PAD_RIGHT is negative to clear the middle gutter.
-ROI_PAD_TOP = 50
-ROI_PAD_BOTTOM = 50
-ROI_PAD_RIGHT = -20
-
-# ---------- CSZ pattern ----------
+# ---------- CSZ pattern (regex constant; not config-tunable) ----------
 # <City>, <ST> <ZIP>. City is letters + spaces + dots + apostrophes + hyphens.
 # Tolerates leading OCR noise (`|`, `:`, `'`, etc.) via the leading \b.
 CSZ_RE = re.compile(
@@ -82,43 +130,31 @@ CSZ_RE = re.compile(
     r"\b"
 )
 
-# ---------- Walker ----------
-MAX_LINES_ABOVE_CSZ = 4
-INITIAL_STRIDE_PAD = 8
-STRIDE_TOLERANCE_MIN = 15
-STRIDE_LOCK_MIN = 30
-STRIDE_LOCK_MAX = 60
-
-# ---------- Boundary phrases (stop walking if hit) ----------
-BOUNDARY_PHRASES = [
-    "ship to", "ship from", "carrier name",
-    "trailer number", "serial number", "bill of lading number",
-    "bar code",
-]
-BOUNDARY_FUZZ = 70
-BOUNDARY_MIN_LEN_FRAC = 0.7
-
-# ---------- Address content classifier ----------
-ADDRESS_WORD_MIN_LEN = 5
+# Helper regexes for is_address_content
 _WORD_RE = re.compile(r"[A-Za-z]+")
 _ATTN_RE = re.compile(r"\battn", re.IGNORECASE)
 _POBOX_RE = re.compile(r"\bp\.?\s*o\.?\s*box\b", re.IGNORECASE)
 
 
-def is_address_content(text: str) -> bool:
-    """True if `text` looks like a real address line. Requires AT LEAST ONE OF:
+def is_address_content(text: str, cfg: ExtractConfig = DEFAULT_CONFIG) -> bool:
+    """True if `text` looks like a real address line. Requires AT LEAST
+    cfg.min_alnum_for_content alphanumeric chars total (rejects 2-char
+    digit-bearing fragments like '4a' that were sneaking through the
+    'has any digit' rule), AND at least one of:
         - any digit (street number, suite, zip, phone, etc.)
         - 'Attn' (case-insensitive)
         - 'P.O. Box' / 'PO Box' pattern
-        - a word of length >= ADDRESS_WORD_MIN_LEN (5) that is either
+        - a word of length >= cfg.address_word_min_len that is either
           capitalized (first letter upper, rest lower) OR all-uppercase
 
-    The 5-letter cap/upper rule is the noise filter. Real address lines
+    The cap/upper-word rule is the noise filter. Real address lines
     almost always contain a 5+ letter "real" word ('Foods', 'Vaughn',
     'Salinas', 'TUCSON', 'SHERIDAN'). The known noise patterns from the
     BOL header decorative band have only short cap-words ('Sati', 'Roca',
     'Ree') or all-lowercase letter clumps ('torent', 'caaik', 'taken'),
     so they fail the rule cleanly."""
+    if sum(c.isalnum() for c in text) < cfg.min_alnum_for_content:
+        return False
     if any(c.isdigit() for c in text):
         return True
     if _ATTN_RE.search(text):
@@ -126,12 +162,12 @@ def is_address_content(text: str) -> bool:
     if _POBOX_RE.search(text):
         return True
     for word in _WORD_RE.findall(text):
-        if len(word) >= ADDRESS_WORD_MIN_LEN and (word[0].isupper() or word.isupper()):
+        if len(word) >= cfg.address_word_min_len and (word[0].isupper() or word.isupper()):
             return True
     return False
 
 
-def matches_boundary(text: str) -> Optional[str]:
+def matches_boundary(text: str, cfg: ExtractConfig = DEFAULT_CONFIG) -> Optional[str]:
     """Return the matched boundary phrase (lowercase) if `text` is one of
     the SHIP TO header / right-column labels, else None. Uses partial_ratio
     with a length floor so a one-char OCR fragment doesn't accidentally
@@ -139,10 +175,10 @@ def matches_boundary(text: str) -> Optional[str]:
     low = text.lower().strip()
     if not low:
         return None
-    for p in BOUNDARY_PHRASES:
-        if len(low) < len(p) * BOUNDARY_MIN_LEN_FRAC:
+    for p in cfg.boundary_phrases:
+        if len(low) < len(p) * cfg.boundary_min_len_frac:
             continue
-        if fuzz.partial_ratio(p, low) >= BOUNDARY_FUZZ:
+        if fuzz.partial_ratio(p, low) >= cfg.boundary_fuzz:
             return p
     return None
 
@@ -166,14 +202,11 @@ def _ocr_roi(img: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> list[dict]:
     return sorted(out, key=lambda d: d["y_top"])
 
 
-# ---------- Pre-walker dedupe ----------
-PSM_DUP_TEXT_SIM = 75
-
-
-def dedupe_psm_duplicates(lines: list[dict]) -> list[dict]:
+def dedupe_psm_duplicates(lines: list[dict],
+                          cfg: ExtractConfig = DEFAULT_CONFIG) -> list[dict]:
     """Collapse OCR lines that are PSM versions of the same physical row.
     Two lines are 'the same row' iff their y-ranges overlap AND their
-    text token_set_ratio is >= PSM_DUP_TEXT_SIM.
+    text token_set_ratio is >= cfg.psm_dup_text_sim.
 
     Checks ALL existing clusters whose members y-overlap with the
     candidate line, not just the most recent one. Otherwise PSM
@@ -188,12 +221,10 @@ def dedupe_psm_duplicates(lines: list[dict]) -> list[dict]:
         text = _line_text(ln).lower()
         joined = False
         for cluster in clusters:
-            # Need at least one cluster member whose y-range overlaps ln.
             if not any(ln["y_top"] <= prior["y_bot"] for prior in cluster):
                 continue
-            # And at least one member whose text is similar.
             if any(fuzz.token_set_ratio(text, _line_text(prior).lower())
-                   >= PSM_DUP_TEXT_SIM for prior in cluster):
+                   >= cfg.psm_dup_text_sim for prior in cluster):
                 cluster.append(ln)
                 joined = True
                 break
@@ -210,7 +241,8 @@ def dedupe_psm_duplicates(lines: list[dict]) -> list[dict]:
         # y_bot into the next row, which moves the line out of the
         # walker's reach).
         max_len = max(len(_line_text(d)) for d in cluster)
-        viable = [d for d in cluster if len(_line_text(d)) >= max_len * 0.8]
+        viable = [d for d in cluster
+                  if len(_line_text(d)) >= max_len * cfg.cluster_min_text_len_frac]
         best = min(viable, key=lambda d: d["y_bot"] - d["y_top"])
         out.append({
             "text": best["text"],
@@ -257,7 +289,7 @@ def find_csz_line(lines: list[dict], roi_y_top: int, roi_y_bot: int) -> Optional
 
 # ---------- Stride-up walker ----------
 def walk_up_from_csz(roi_lines: list[dict], csz_line: dict, mid_y: int,
-                     max_steps: int = MAX_LINES_ABOVE_CSZ
+                     cfg: ExtractConfig = DEFAULT_CONFIG
                      ) -> tuple[list[dict], str, Optional[dict]]:
     """Walk up from CSZ one line at a time. Return (address_lines_in_order,
     stop_reason, stop_at_line). Stride is initially CSZ height + pad,
@@ -265,18 +297,18 @@ def walk_up_from_csz(roi_lines: list[dict], csz_line: dict, mid_y: int,
     hop."""
     address = [csz_line]
     csz_height = csz_line["y_bot"] - csz_line["y_top"]
-    stride = csz_height + INITIAL_STRIDE_PAD
+    stride = csz_height + cfg.initial_stride_pad
     last_y_top = csz_line["y_top"]
-    stop_reason = f"reached max_steps={max_steps}"
+    stop_reason = f"reached max_steps={cfg.max_lines_above_csz}"
     stop_at: Optional[dict] = None
 
-    for _ in range(max_steps):
+    for _ in range(cfg.max_lines_above_csz):
         target = last_y_top - stride
         if target < mid_y:
             stop_reason = f"target y={target} below mid_y={mid_y}"
             break
 
-        tolerance = max(stride // 2, STRIDE_TOLERANCE_MIN)
+        tolerance = max(stride // 2, cfg.stride_tolerance_min)
         candidates = [
             ln for ln in roi_lines
             if ln["y_top"] < last_y_top
@@ -303,34 +335,32 @@ def walk_up_from_csz(roi_lines: list[dict], csz_line: dict, mid_y: int,
         # the walk prematurely.
         content_groups = [
             g for g in groups
-            if any(is_address_content(_line_text(ln)) for ln in g)
-            and not any(matches_boundary(_line_text(ln)) for ln in g)
+            if any(is_address_content(_line_text(ln), cfg) for ln in g)
+            and not any(matches_boundary(_line_text(ln), cfg) for ln in g)
         ]
         eligible = content_groups if content_groups else groups
         best_group = min(eligible, key=lambda g: abs(g[0]["y_top"] - target))
-        # Within the chosen group, prefer a content-passing member (and
-        # break ties by smallest height for a clean bbox).
         members = sorted(
             best_group,
-            key=lambda ln: (not is_address_content(_line_text(ln)),
+            key=lambda ln: (not is_address_content(_line_text(ln), cfg),
                             ln["y_bot"] - ln["y_top"]),
         )
         best = members[0]
         text = _line_text(best)
 
-        b = matches_boundary(text)
+        b = matches_boundary(text, cfg)
         if b:
             stop_reason = f"boundary '{b}' @ {text[:50]!r}"
             stop_at = best
             break
-        if not is_address_content(text):
+        if not is_address_content(text, cfg):
             stop_reason = f"non-content @ {text[:50]!r}"
             stop_at = best
             break
 
         address.insert(0, best)
         actual_stride = last_y_top - best["y_top"]
-        if STRIDE_LOCK_MIN < actual_stride < STRIDE_LOCK_MAX:
+        if cfg.stride_lock_min < actual_stride < cfg.stride_lock_max:
             stride = actual_stride
         last_y_top = best["y_top"]
 
@@ -418,16 +448,18 @@ def annotate(img: np.ndarray, mid_y: int, lower_y: int, upper_y: int,
 
 
 # ---------- Pipeline ----------
-def process(pdf_path: Path, out_dir: Path, dpi: int,
-            fuzz_threshold: int) -> tuple[Optional[Path], str]:
-    img = render_pdf_page(pdf_path, page_index=1, dpi=dpi)
+def process(pdf_path: Path, out_dir: Path,
+            cfg: ExtractConfig = DEFAULT_CONFIG) -> tuple[Optional[Path], str]:
+    img = render_pdf_page(pdf_path, page_index=1, dpi=cfg.dpi)
     img = crop_to_document(img)
     h, w = img.shape[:2]
 
     # Step 1: bounds.
     full_lines = ocr_lines_with_sparse(img)
-    upper_sigs = find_anchor_signals(full_lines, UPPER_TARGET, "BOLN", fuzz_threshold)
-    lower_sigs = find_anchor_signals(full_lines, LOWER_TARGET, "HBF", fuzz_threshold)
+    upper_sigs = find_anchor_signals(full_lines, UPPER_TARGET, "BOLN",
+                                     cfg.bounds_fuzz_threshold)
+    lower_sigs = find_anchor_signals(full_lines, LOWER_TARGET, "HBF",
+                                     cfg.bounds_fuzz_threshold)
     upper_y = _aggregate(upper_sigs)
     lower_y = _aggregate(lower_sigs)
     if upper_y is None:
@@ -440,11 +472,11 @@ def process(pdf_path: Path, out_dir: Path, dpi: int,
 
     # Step 2: focused OCR of the SHIP TO ROI.
     roi_x1 = 0
-    roi_x2 = min(w, w // 2 + ROI_PAD_RIGHT)
-    roi_y1 = max(0, mid_y - ROI_PAD_TOP)
-    roi_y2 = min(h, lower_y + ROI_PAD_BOTTOM)
+    roi_x2 = min(w, w // 2 + cfg.roi_pad_right)
+    roi_y1 = max(0, mid_y - cfg.roi_pad_top)
+    roi_y2 = min(h, lower_y + cfg.roi_pad_bottom)
     roi_lines = _ocr_roi(img, roi_x1, roi_y1, roi_x2, roi_y2)
-    roi_lines = dedupe_psm_duplicates(roi_lines)
+    roi_lines = dedupe_psm_duplicates(roi_lines, cfg)
 
     # Step 3: CSZ anchor.
     csz = find_csz_line(roi_lines, roi_y1, roi_y2)
@@ -454,7 +486,7 @@ def process(pdf_path: Path, out_dir: Path, dpi: int,
     stop_reason = "no CSZ found"
     stop_at: Optional[dict] = None
     if csz is not None:
-        address, stop_reason, stop_at = walk_up_from_csz(roi_lines, csz, mid_y)
+        address, stop_reason, stop_at = walk_up_from_csz(roi_lines, csz, mid_y, cfg)
 
     annotated = annotate(img, mid_y, lower_y, upper_y, csz,
                          address, stop_reason, stop_at)
@@ -471,16 +503,49 @@ def process(pdf_path: Path, out_dir: Path, dpi: int,
     return out_path, summary + "\n" + "\n".join(line_strs)
 
 
+def _build_config_from_args(args: argparse.Namespace) -> ExtractConfig:
+    """Build an ExtractConfig from CLI overrides, falling back to defaults
+    for anything not specified."""
+    overrides = {
+        k: v for k, v in {
+            "dpi": args.dpi,
+            "bounds_fuzz_threshold": args.bounds_fuzz_threshold,
+            "roi_pad_right": args.roi_pad_right,
+            "roi_pad_top": args.roi_pad_top,
+            "roi_pad_bottom": args.roi_pad_bottom,
+            "max_lines_above_csz": args.max_lines_above_csz,
+            "boundary_fuzz": args.boundary_fuzz,
+            "psm_dup_text_sim": args.psm_dup_text_sim,
+        }.items() if v is not None
+    }
+    return replace(DEFAULT_CONFIG, **overrides) if overrides else DEFAULT_CONFIG
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pdfs", nargs="+", type=Path)
     ap.add_argument("--out-dir", type=Path, default=Path("shipto_bounds"))
-    ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--fuzz-threshold", type=int, default=DEFAULT_FUZZ_THRESHOLD)
     ap.add_argument("--no-wipe", action="store_true",
                     help="Do not wipe out-dir at start (default wipes)")
+
+    # Config overrides. All default to None -> falls back to DEFAULT_CONFIG.
+    cfg = ap.add_argument_group("config overrides (defaults from ExtractConfig)")
+    cfg.add_argument("--dpi", type=int, default=None)
+    cfg.add_argument("--bounds-fuzz-threshold", type=int, default=None,
+                     help="Fuzz threshold for BOLN/HBF anchor detection")
+    cfg.add_argument("--roi-pad-right", type=int, default=None,
+                     help="px past w/2 for ROI right edge (negative = inside col 1)")
+    cfg.add_argument("--roi-pad-top", type=int, default=None)
+    cfg.add_argument("--roi-pad-bottom", type=int, default=None)
+    cfg.add_argument("--max-lines-above-csz", type=int, default=None)
+    cfg.add_argument("--boundary-fuzz", type=int, default=None,
+                     help="partial_ratio threshold for boundary phrase match")
+    cfg.add_argument("--psm-dup-text-sim", type=int, default=None,
+                     help="token_set_ratio threshold for PSM-duplicate dedupe")
     args = ap.parse_args(argv)
+
+    config = _build_config_from_args(args)
 
     if args.out_dir.exists() and not args.no_wipe:
         shutil.rmtree(args.out_dir)
@@ -489,8 +554,7 @@ def main(argv: list[str]) -> int:
     ok = 0
     for pdf in args.pdfs:
         try:
-            out_path, note = process(pdf, args.out_dir, dpi=args.dpi,
-                                     fuzz_threshold=args.fuzz_threshold)
+            out_path, note = process(pdf, args.out_dir, config)
         except Exception as e:
             print(f"{pdf}: ERROR {e}")
             continue
