@@ -62,9 +62,13 @@ LINE_THICK = 3
 TEXT_FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # ---------- ROI ----------
+# Keep the ROI strictly inside column 1. The SHIP TO content lives in
+# the left half of the page; column 2 carries CARRIER NAME / TRAILER /
+# SCAC labels whose OCR fragments ('Tr', 'Trai', 'Traike') were polluting
+# the walker. ROI_PAD_RIGHT is negative to clear the middle gutter.
 ROI_PAD_TOP = 50
 ROI_PAD_BOTTOM = 50
-ROI_PAD_RIGHT = 30
+ROI_PAD_RIGHT = -20
 
 # ---------- CSZ pattern ----------
 # <City>, <ST> <ZIP>. City is letters + spaces + dots + apostrophes + hyphens.
@@ -169,33 +173,45 @@ PSM_DUP_TEXT_SIM = 75
 def dedupe_psm_duplicates(lines: list[dict]) -> list[dict]:
     """Collapse OCR lines that are PSM versions of the same physical row.
     Two lines are 'the same row' iff their y-ranges overlap AND their
-    text token_set_ratio is >= PSM_DUP_TEXT_SIM. Within a cluster, keep
-    the tightest-height member (preserves a clean bbox)."""
+    text token_set_ratio is >= PSM_DUP_TEXT_SIM.
+
+    Checks ALL existing clusters whose members y-overlap with the
+    candidate line, not just the most recent one. Otherwise PSM
+    duplicates of the same row split into separate clusters when noise
+    lines (with different text) at intermediate y_top values fall
+    between them in the sort order."""
     if not lines:
         return []
     sorted_lines = sorted(lines, key=lambda d: d["y_top"])
-    clusters: list[list[dict]] = [[sorted_lines[0]]]
-    for ln in sorted_lines[1:]:
+    clusters: list[list[dict]] = []
+    for ln in sorted_lines:
         text = _line_text(ln).lower()
         joined = False
-        for prior in clusters[-1]:
-            if ln["y_top"] > prior["y_bot"]:
-                continue  # no y overlap with this prior
-            if fuzz.token_set_ratio(text, _line_text(prior).lower()) >= PSM_DUP_TEXT_SIM:
-                clusters[-1].append(ln)
+        for cluster in clusters:
+            # Need at least one cluster member whose y-range overlaps ln.
+            if not any(ln["y_top"] <= prior["y_bot"] for prior in cluster):
+                continue
+            # And at least one member whose text is similar.
+            if any(fuzz.token_set_ratio(text, _line_text(prior).lower())
+                   >= PSM_DUP_TEXT_SIM for prior in cluster):
+                cluster.append(ln)
                 joined = True
                 break
         if not joined:
             clusters.append([ln])
     out = []
     for cluster in clusters:
-        # Within a cluster of same-row PSM duplicates, prefer the LONGEST
-        # text (preserves the full CSZ pattern -- a tight-bbox fragment
-        # like '85706' alone would lose the city/state). Tie-break on
-        # smallest bbox height for a clean visual box.
-        best = max(cluster,
-                   key=lambda d: (len(_line_text(d)),
-                                  -(d["y_bot"] - d["y_top"])))
+        # Two-stage selection. First, drop fragment-like cluster members
+        # whose text is much shorter than the cluster's longest text --
+        # otherwise a 5-char OCR fragment ('AZ 85') would beat the full
+        # CSZ line on tightness. Second, among the survivors, pick the
+        # tightest bbox -- among versions with equally complete text,
+        # the cleanest box wins (avoids PSM 11's habit of inflating
+        # y_bot into the next row, which moves the line out of the
+        # walker's reach).
+        max_len = max(len(_line_text(d)) for d in cluster)
+        viable = [d for d in cluster if len(_line_text(d)) >= max_len * 0.8]
+        best = min(viable, key=lambda d: d["y_bot"] - d["y_top"])
         out.append({
             "text": best["text"],
             "y_top": best["y_top"],
