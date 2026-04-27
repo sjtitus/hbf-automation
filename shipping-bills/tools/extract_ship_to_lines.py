@@ -36,6 +36,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import pytesseract
 from rapidfuzz import fuzz
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -73,10 +74,13 @@ class ExtractConfig:
     bounds_fuzz_threshold: int = DEFAULT_FUZZ_THRESHOLD
 
     # --- ROI (focused OCR window for the SHIP TO area) ---
-    # x_right is computed as `w/2 + roi_pad_right`. Negative values keep
-    # the ROI strictly inside column 1 (avoids right-column noise like
-    # 'Trai', 'Traike') but can truncate column-1 content on wider BOLs.
-    # Cut at exactly w/2 (pad=0) is the current sweet spot.
+    # x_right is computed as `divider_x + roi_pad_right`, where divider_x
+    # is the midpoint between the words SHORT and FORM in the page header
+    # (per-BOL detection of the column 1 / column 2 boundary). Falls back
+    # to `w/2` when the header words can't be found. Positive pad pushes
+    # the cut into the gutter to catch slight column-1 overflow (e.g.,
+    # 'SHERIDAN FOC & CAMP' on 0065935 extends past the form's nominal
+    # divider).
     roi_pad_top: int = 50
     roi_pad_bottom: int = 50
     roi_pad_right: int = 0
@@ -181,6 +185,64 @@ def matches_boundary(text: str, cfg: ExtractConfig = DEFAULT_CONFIG) -> Optional
         if fuzz.partial_ratio(p, low) >= cfg.boundary_fuzz:
             return p
     return None
+
+
+# ---------- Header word anchor experiment ----------
+# Find 'SHORT' x_right and 'FORM' x_left in the page header
+# 'BILL OF LADING — SHORT FORM — NOT NEGOTIABLE'. The em-dash between
+# SHORT and FORM is the visual divider that may align with the form's
+# column-1/column-2 boundary. Reporting both anchors plus their midpoint
+# so we can eyeball which (if any) matches the actual column divider.
+def _find_header_word(img: np.ndarray, target: str,
+                      threshold: int = 75) -> Optional[dict]:
+    """Word-level OCR the top of the page; return the topmost word that
+    fuzz-matches `target`. Returns dict with x_left, x_right, y_top,
+    text, score; or None if no match."""
+    h = img.shape[0]
+    header_h = min(h, max(300, int(h * 0.10)))
+    crop = img[:header_h, :]
+    bin_crop = _binarize(crop)
+    data = pytesseract.image_to_data(
+        bin_crop, output_type=pytesseract.Output.DICT,
+        config="--oem 3 --psm 6 -c preserve_interword_spaces=1",
+    )
+    target_len = len(target)
+    candidates: list[dict] = []
+    for i in range(len(data["text"])):
+        word = data["text"][i].strip()
+        if not word or len(word) > target_len + 2:
+            continue
+        score = fuzz.ratio(word.upper(), target.upper())
+        if score >= threshold:
+            candidates.append({
+                "text": word,
+                "x_left": data["left"][i],
+                "x_right": data["left"][i] + data["width"][i],
+                "y_top": data["top"][i],
+                "score": score,
+            })
+    if not candidates:
+        return None
+    candidates.sort(key=lambda d: (d["y_top"], -d["score"]))
+    return candidates[0]
+
+
+def find_header_anchors(img: np.ndarray) -> dict:
+    """Return {'short': dict|None, 'form': dict|None, 'divider_x': int|None}.
+    'divider_x' is the midpoint between SHORT's x_right and FORM's x_left
+    when both are found; falls back to FORM's x_left if only FORM is
+    available, SHORT's x_right if only SHORT is, else None."""
+    short = _find_header_word(img, "SHORT")
+    form = _find_header_word(img, "FORM")
+    if short is not None and form is not None:
+        divider = (short["x_right"] + form["x_left"]) // 2
+    elif form is not None:
+        divider = form["x_left"]
+    elif short is not None:
+        divider = short["x_right"]
+    else:
+        divider = None
+    return {"short": short, "form": form, "divider_x": divider}
 
 
 # ---------- OCR ----------
@@ -340,9 +402,16 @@ def walk_up_from_csz(roi_lines: list[dict], csz_line: dict, mid_y: int,
         ]
         eligible = content_groups if content_groups else groups
         best_group = min(eligible, key=lambda g: abs(g[0]["y_top"] - target))
+        # Within the chosen group, prefer:
+        #   1. Members that pass the content check
+        #   2. Longer text (catches Sheridan: PSM 6 'SHERIDAN FOC & CAMP'
+        #      vs PSM 11 'SHERID.' both at y=629; without this, tightest
+        #      bbox wins and the truncated 'SHERID.' is picked)
+        #   3. Tightest bbox
         members = sorted(
             best_group,
             key=lambda ln: (not is_address_content(_line_text(ln), cfg),
+                            -len(_line_text(ln)),
                             ln["y_bot"] - ln["y_top"]),
         )
         best = members[0]
@@ -387,7 +456,8 @@ def _draw_dashed_hline(img, y, color, thick=2, dash=22, gap=14):
 
 def annotate(img: np.ndarray, mid_y: int, lower_y: int, upper_y: int,
              csz: Optional[dict], address_lines: list[dict],
-             stop_reason: str, stop_at: Optional[dict]) -> np.ndarray:
+             stop_reason: str, stop_at: Optional[dict],
+             header_anchors: Optional[dict] = None) -> np.ndarray:
     out = img.copy()
     h, w = out.shape[:2]
 
@@ -398,6 +468,37 @@ def annotate(img: np.ndarray, mid_y: int, lower_y: int, upper_y: int,
     _put(out, f"LOWER y={lower_y}", (12, max(22, lower_y - 10)), RED, scale=0.7)
     _draw_full_width_line(out, mid_y, MID_GREEN)
     _put(out, f"MID y={mid_y}", (12, max(22, mid_y - 10)), MID_GREEN, scale=0.7)
+
+    # Reference: dotted line at exactly w/2 for visual comparison.
+    cv2.line(out, (w // 2, 0), (w // 2, h - 1), (180, 180, 180), 1, cv2.LINE_AA)
+    _put(out, f"w/2={w//2}", (w // 2 + 6, 30), (140, 140, 140), scale=0.7)
+
+    # Header-word anchor vertical lines (experiment).
+    #   blue  = end of SHORT (x_right)
+    #   magenta = start of FORM (x_left)
+    #   yellow = midpoint between them (candidate column-1 boundary)
+    if header_anchors is not None:
+        short = header_anchors.get("short")
+        form = header_anchors.get("form")
+        divider = header_anchors.get("divider_x")
+        BLUE = (220, 100, 0)
+        MAGENTA = (220, 0, 220)
+        YELLOW_THICK = (0, 220, 255)
+        if short is not None:
+            sx = short["x_right"]
+            cv2.line(out, (sx, 0), (sx, h - 1), BLUE, 2, cv2.LINE_AA)
+            _put(out, f"SHORT end x={sx}", (max(12, sx - 280), 90),
+                 BLUE, scale=0.7)
+        if form is not None:
+            fx = form["x_left"]
+            cv2.line(out, (fx, 0), (fx, h - 1), MAGENTA, 2, cv2.LINE_AA)
+            _put(out, f"FORM start x={fx}", (fx + 8, 90), MAGENTA, scale=0.7)
+        if divider is not None:
+            cv2.line(out, (divider, 0), (divider, h - 1), YELLOW_THICK, 4, cv2.LINE_AA)
+            delta = divider - (w // 2)
+            sign = "+" if delta >= 0 else ""
+            _put(out, f"DIVIDER x={divider} ({sign}{delta} from w/2)",
+                 (max(12, divider - 480), 130), YELLOW_THICK, scale=0.85)
 
     if csz is None:
         return out
@@ -423,10 +524,15 @@ def annotate(img: np.ndarray, mid_y: int, lower_y: int, upper_y: int,
         _put(out, label, (ln["x_right"] + 14, ln["y_bot"]),
              CYAN, scale=0.65)
 
-    # Final orange box around all captured address lines.
+    # Final orange box around all captured address lines. Clip x_right to
+    # the column divider (when known) so the box doesn't overshoot into
+    # column 2 when an OCR line accidentally swept up trailing fragments
+    # like the 't' in 'VICTORVILLE FCI 1 t' (a column-2 'Trailer' bleed).
     if address_lines:
         ux1 = min(ln["x_left"] for ln in address_lines) - 12
         ux2 = max(ln["x_right"] for ln in address_lines) + 12
+        if header_anchors is not None and header_anchors.get("divider_x") is not None:
+            ux2 = min(ux2, header_anchors["divider_x"])
         uy1 = min(ln["y_top"] for ln in address_lines) - 12
         uy2 = max(ln["y_bot"] for ln in address_lines) + 12
         cv2.rectangle(out, (ux1, uy1), (ux2, uy2), ORANGE, FINAL_RECT_THICK)
@@ -470,9 +576,16 @@ def process(pdf_path: Path, out_dir: Path,
         return None, f"FAIL: bounds incomplete upper={upper_y} lower={lower_y}"
     mid_y = (upper_y + lower_y) // 2
 
-    # Step 2: focused OCR of the SHIP TO ROI.
+    # Step 2a: detect column 1 / column 2 divider via the page header
+    # words SHORT and FORM. We do this BEFORE the ROI OCR so we can use
+    # the per-BOL divider as the ROI's right edge.
+    header_anchors = find_header_anchors(img)
+    divider_x = header_anchors.get("divider_x")
+    base_right = divider_x if divider_x is not None else (w // 2)
+
+    # Step 2b: focused OCR of the SHIP TO ROI.
     roi_x1 = 0
-    roi_x2 = min(w, w // 2 + cfg.roi_pad_right)
+    roi_x2 = min(w, base_right + cfg.roi_pad_right)
     roi_y1 = max(0, mid_y - cfg.roi_pad_top)
     roi_y2 = min(h, lower_y + cfg.roi_pad_bottom)
     roi_lines = _ocr_roi(img, roi_x1, roi_y1, roi_x2, roi_y2)
@@ -489,18 +602,29 @@ def process(pdf_path: Path, out_dir: Path,
         address, stop_reason, stop_at = walk_up_from_csz(roi_lines, csz, mid_y, cfg)
 
     annotated = annotate(img, mid_y, lower_y, upper_y, csz,
-                         address, stop_reason, stop_at)
+                         address, stop_reason, stop_at, header_anchors)
     out_path = out_dir / f"{pdf_path.stem}_extract.png"
     cv2.imwrite(str(out_path), annotated)
 
+    short = header_anchors["short"]
+    form = header_anchors["form"]
+    divider = header_anchors["divider_x"]
+    anchor_str = (
+        f"  SHORT x_right={short['x_right'] if short else 'NF'}  "
+        f"FORM x_left={form['x_left'] if form else 'NF'}  "
+        f"DIVIDER={divider} (w/2={w//2}"
+        + (f", delta={divider - w//2:+d}" if divider is not None else "")
+        + ")"
+    )
+
     if csz is None:
-        return out_path, f"NO CSZ found in ROI y=[{roi_y1},{roi_y2}]"
+        return out_path, f"NO CSZ found in ROI y=[{roi_y1},{roi_y2}]\n{anchor_str}"
 
     line_strs = [f"  {i+1}. y=[{ln['y_top']:4d}-{ln['y_bot']:4d}]  {_line_text(ln)!r}"
                  for i, ln in enumerate(address)]
     summary = (f"CSZ {csz['csz_city']!r}, {csz['csz_state']} {csz['csz_zip']}  "
                f"({len(address)} address lines, stop: {stop_reason})")
-    return out_path, summary + "\n" + "\n".join(line_strs)
+    return out_path, summary + "\n" + "\n".join(line_strs) + "\n" + anchor_str
 
 
 def _build_config_from_args(args: argparse.Namespace) -> ExtractConfig:
