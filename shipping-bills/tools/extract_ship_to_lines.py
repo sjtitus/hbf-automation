@@ -77,13 +77,18 @@ class ExtractConfig:
     # x_right is computed as `divider_x + roi_pad_right`, where divider_x
     # is the midpoint between the words SHORT and FORM in the page header
     # (per-BOL detection of the column 1 / column 2 boundary). Falls back
-    # to `w/2` when the header words can't be found. Positive pad pushes
-    # the cut into the gutter to catch slight column-1 overflow (e.g.,
-    # 'SHERIDAN FOC & CAMP' on 0065935 extends past the form's nominal
-    # divider).
+    # to `w/2` when the header words can't be found.
+    #
+    # +60 of gutter pad past divider_x is calibrated empirically: gives
+    # tesseract enough right-margin context that it doesn't re-segment
+    # column-1 lines differently. At pad=0 'Vistar Retail West' was
+    # dropped entirely on 0065560; at +30 it stayed dropped; +60
+    # recovers it. The gutter region is whitespace on Badger BOLs at
+    # ~60 px wide, so the pad lands at the start of column 2 without
+    # consistently grabbing column-2 text.
     roi_pad_top: int = 50
     roi_pad_bottom: int = 50
-    roi_pad_right: int = 0
+    roi_pad_right: int = 60
 
     # --- PSM-duplicate dedupe (collapse same-row OCR variants) ---
     psm_dup_text_sim: int = 75            # token_set_ratio threshold
