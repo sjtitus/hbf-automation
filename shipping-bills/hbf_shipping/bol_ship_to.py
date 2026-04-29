@@ -672,12 +672,14 @@ def _parse_street_from_address_lines(address_lines: list[dict],
 @dataclass(frozen=True)
 class ShipToResult:
     pdf_path: Path
-    address: Optional[Address]              # normalized 4-tuple, None on extraction failure
+    success: bool                           # True iff a usable Address was produced
+    failure_reason: Optional[str]           # human-readable why-it-failed; None on success
+    address: Optional[Address]              # normalized 4-tuple, None on failure
+    consignee_name: Optional[str]           # cleaned topmost OCR line above CSZ (facility/company name)
     raw_lines: list[str]                    # captured OCR lines, top-down (CSZ last)
     csz_line: Optional[str]                 # the CSZ row text, e.g. 'Tucson, AZ 85756'
     diagnostic_path: Optional[Path]         # PNG path, only when diagnostic_dir was set
-    status: str                             # 'ok' | 'no_csz' | 'bounds_incomplete'
-    notes: str                              # multi-line diagnostic summary
+    diagnostics: str                        # multi-line diagnostic dump (walker stop reason, line y-coords, column divider, etc.)
 
 
 def extract_ship_to(
@@ -715,10 +717,32 @@ def extract_ship_to(
             upper_y = header[0] + profile.header_fallback_pad_px
 
     if upper_y is None or lower_y is None:
+        upper_t = profile.upper_anchor_target
+        lower_t = profile.lower_anchor_target
+        if upper_y is None and lower_y is None:
+            reason = (
+                f"Could not locate the SHIP TO block on the BOL: neither the "
+                f"upper anchor ({upper_t!r}) nor the lower anchor "
+                f"({lower_t!r}) could be matched in the page-2 OCR output."
+            )
+        elif upper_y is None:
+            reason = (
+                f"Could not locate the top of the SHIP TO block: the upper "
+                f"anchor ({upper_t!r}) was not matched in OCR. The lower "
+                f"anchor ({lower_t!r}) was found at y={lower_y}."
+            )
+        else:
+            reason = (
+                f"Could not locate the bottom of the SHIP TO block: the "
+                f"lower anchor ({lower_t!r}) was not matched in OCR. The "
+                f"upper anchor ({upper_t!r}) was found at y={upper_y}."
+            )
         return ShipToResult(
-            pdf_path=pdf_path, address=None, raw_lines=[], csz_line=None,
-            diagnostic_path=None, status="bounds_incomplete",
-            notes=f"FAIL: bounds incomplete upper={upper_y} lower={lower_y}",
+            pdf_path=pdf_path, success=False, failure_reason=reason,
+            address=None, consignee_name=None,
+            raw_lines=[], csz_line=None,
+            diagnostic_path=None,
+            diagnostics=f"FAIL: {reason}",
         )
 
     mid_y = (upper_y + lower_y) // 2
@@ -769,10 +793,18 @@ def extract_ship_to(
     )
 
     if csz is None:
+        reason = (
+            f"Found the SHIP TO block but no city/state/ZIP line was "
+            f"identified inside it (searched y=[{roi_y1}, {roi_y2}]). "
+            f"OCR may have garbled the line, or it may sit outside the "
+            f"expected vertical range."
+        )
         return ShipToResult(
-            pdf_path=pdf_path, address=None, raw_lines=[], csz_line=None,
-            diagnostic_path=diagnostic_path, status="no_csz",
-            notes=f"NO CSZ found in ROI y=[{roi_y1},{roi_y2}]\n{anchor_str}",
+            pdf_path=pdf_path, success=False, failure_reason=reason,
+            address=None, consignee_name=None,
+            raw_lines=[], csz_line=None,
+            diagnostic_path=diagnostic_path,
+            diagnostics=f"FAIL: {reason}\n{anchor_str}",
         )
 
     # Step 5: USPS-normalize.
@@ -785,14 +817,41 @@ def extract_ship_to(
     raw_lines = [_line_text(ln) for ln in address]
     csz_text = f"{csz['csz_city']}, {csz['csz_state']} {csz['csz_zip']}"
 
+    # Topmost captured line (raw_lines[0]) is conventionally the
+    # facility/company name on Badger BOLs; CSZ sits at raw_lines[-1].
+    # Only populate when we got at least one line above CSZ.
+    consignee_name: Optional[str] = None
+    if len(raw_lines) >= 2:
+        cleaned = _clean_for_usps(raw_lines[0])
+        consignee_name = cleaned or None
+
     line_strs = [f"  {i+1}. y=[{ln['y_top']:4d}-{ln['y_bot']:4d}]  {_line_text(ln)!r}"
                  for i, ln in enumerate(address)]
     summary = (f"CSZ {csz['csz_city']!r}, {csz['csz_state']} {csz['csz_zip']}  "
                f"({len(address)} address lines, stop: {stop_reason})")
     addr_str = f"\n  ADDRESS  {addr}" if addr is not None else "\n  ADDRESS  None (no street parsed)"
 
+    failure_reason: Optional[str] = None
+    if addr is None:
+        above_csz = raw_lines[:-1]
+        if above_csz:
+            failure_reason = (
+                f"Found the city/state/ZIP line ({csz_text!r}) but no street "
+                f"address line could be identified among the captured lines "
+                f"above it: {above_csz}. The walker may have stopped early "
+                f"or the OCR did not surface a recognizable street."
+            )
+        else:
+            failure_reason = (
+                f"Found the city/state/ZIP line ({csz_text!r}) but no other "
+                f"lines were captured above it; cannot extract a street address."
+            )
+
     return ShipToResult(
-        pdf_path=pdf_path, address=addr, raw_lines=raw_lines,
-        csz_line=csz_text, diagnostic_path=diagnostic_path, status="ok",
-        notes=summary + "\n" + "\n".join(line_strs) + "\n" + anchor_str + addr_str,
+        pdf_path=pdf_path, success=(addr is not None),
+        failure_reason=failure_reason,
+        address=addr, consignee_name=consignee_name,
+        raw_lines=raw_lines, csz_line=csz_text,
+        diagnostic_path=diagnostic_path,
+        diagnostics=summary + "\n" + "\n".join(line_strs) + "\n" + anchor_str + addr_str,
     )
