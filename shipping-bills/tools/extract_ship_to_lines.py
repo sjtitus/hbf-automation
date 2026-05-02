@@ -23,8 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from hbf_shipping.bol_ship_to import (  # noqa: E402
     extract_ship_to, BolProfile, BADGER_PROFILE, ExtractConfig, DEFAULT_CONFIG,
-    ShipToResult,
 )
+from hbf_shipping.ship_to import BolExtraction  # noqa: E402
 
 
 PROFILES: dict[str, BolProfile] = {
@@ -32,13 +32,18 @@ PROFILES: dict[str, BolProfile] = {
 }
 
 
-def _result_to_json_dict(r: ShipToResult) -> dict:
+def _result_to_json_dict(r: BolExtraction) -> dict:
+    s = r.ship_to
     return {
         "pdf_path": str(r.pdf_path),
         "success": r.success,
         "failure_reason": r.failure_reason,
-        "consignee_name": r.consignee_name,
-        "address": (dict(r.address._asdict()) if r.address else None),
+        "ship_to": {
+            "name": s.name,
+            "name_candidates": list(s.name_candidates),
+            "address": (dict(s.address._asdict()) if s.address else None),
+            "source": s.source,
+        },
         "csz_line": r.csz_line,
         "raw_lines": list(r.raw_lines),
         "diagnostic_path": (str(r.diagnostic_path) if r.diagnostic_path else None),

@@ -1,12 +1,14 @@
 """
-Command-line entry point for the shipping-bills tool.
+Command-line entry point for the shipping-bills tool (stage 1).
 
-Parses arguments, dispatches to the requested vendor's pipeline, prints a
-CSV preview, and (unless --dry-run) writes the QuickBooks-shaped batch-bills
-CSV to ./quickbooks-imports/.
+Parses arguments, dispatches to the requested vendor's stage-1 ShipTo
+extraction pipeline, and prints per-invoice + batch summaries.
 
-Run from the project root — output directories (logs/, processing-logs/,
-quickbooks-imports/) are CWD-relative.
+Stage 1 stops after producing canonical ShipTo records (page-1 + BOL).
+Customer matching, BillEntry construction, and QuickBooks CSV export
+will be re-introduced in stage 2 against the new ShipTo shape.
+
+Run from the project root — output directory (logs/) is CWD-relative.
 """
 
 import argparse
@@ -28,12 +30,15 @@ def _existing_dir(raw: str) -> Path:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HBF shipping-vendor invoice processor.",
+        description=(
+            "HBF shipping-vendor invoice ShipTo extractor (stage 1). "
+            "Runs page-1 + BOL ShipTo extraction on every PDF in a directory "
+            "and prints a comparison summary."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python3 -m hbf_shipping --vendor badger ./badger-invoices/
-  python3 -m hbf_shipping --vendor badger --dry-run ./badger-invoices/
 """,
     )
     parser.add_argument(
@@ -48,17 +53,8 @@ Examples:
         type=_existing_dir,
         help=(
             'Path to a directory containing one or more invoice PDFs. '
-            'All *.pdf files in the directory are processed and aggregated '
-            'into a single batch-bills CSV.'
-        ),
-    )
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help=(
-            'Parse, apply business rules, and print the CSV preview only. '
-            'Do NOT write the CSV file. Default behavior writes '
-            'quickbooks-imports/bills-<vendor>-YYYYMMDD-HHMMSS.csv.'
+            'All *.pdf files in the directory have their SHIP TO record '
+            'extracted from page 1 (text) and page 2 (BOL OCR).'
         ),
     )
 
@@ -67,9 +63,9 @@ Examples:
     run_id, run_dir = setup_run(args.vendor)
 
     vendor = VENDORS[args.vendor]
-    pipeline = Pipeline(vendor, run_id=run_id, run_dir=run_dir, dry_run=args.dry_run)
+    pipeline = Pipeline(vendor, run_id=run_id, run_dir=run_dir)
     pipeline.process_batch(args.invoice_dir)
-    pipeline.flush(args.vendor)
+    pipeline.report()
 
 
 if __name__ == '__main__':

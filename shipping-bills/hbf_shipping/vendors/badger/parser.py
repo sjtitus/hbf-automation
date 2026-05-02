@@ -253,3 +253,23 @@ class BadgerInvoiceParser:
 def parse_invoice(pdf_path):
     """Parse a Badger invoice PDF. Returns (data, reasons) — dicts keyed by field name."""
     return BadgerInvoiceParser(pdf_path).parse()
+
+
+def extract_invoice_ship_to(pdf_path, invoice_data: dict):
+    """Map already-parsed page-1 fields onto the canonical InvoiceExtraction
+    shape. The pipeline calls `parse_invoice` first to populate
+    `invoice_data`, then hands the consignee-block fields here so the
+    page-1 ShipTo lands in the same NormalizedAddress shape produced by
+    `bol_ship_to.extract_ship_to`.
+    """
+    from pathlib import Path
+    from hbf_shipping.ship_to import extract_invoice_ship_to as _extract
+    return _extract(
+        Path(pdf_path),
+        name=invoice_data.get('consignee'),
+        line_1=invoice_data.get('consignee_address_line_1'),
+        line_2=invoice_data.get('consignee_address_line_2'),
+        city=invoice_data.get('consignee_city'),
+        state=invoice_data.get('consignee_state'),
+        postcode=invoice_data.get('consignee_postcode'),
+    )

@@ -2,9 +2,10 @@
 Shipper-agnostic SHIP TO address extractor for vendor BOL (Bill of Lading) images.
 
 Renders page 2 of an invoice PDF, OCRs the SHIP TO block, walks up from the
-city/state/zip line to capture address lines, normalizes the result through
-the standard USPS pipeline (Pub 28 §354 character cleanup -> scourgify), and
-returns a normalized Address ready to consume.
+city/state/zip line to capture address lines, classifies them into
+name vs. street vs. line_2 material, normalizes the address through the
+standard USPS pipeline (Pub 28 §354 character cleanup -> scourgify), and
+returns a `BolExtraction` carrying a canonical `ShipTo`.
 
 Per-shipper specifics (anchor strings, header fallback target, column-divider
 words, boundary phrases that stop the walker) are carried in BolProfile.
@@ -14,8 +15,8 @@ constants in this file; the extractor itself is generic.
 
 Public surface:
     extract_ship_to(pdf_path, *, profile=BADGER_PROFILE, config=DEFAULT_CONFIG,
-                    diagnostic_dir=None) -> ShipToResult
-    ShipToResult, BolProfile, BADGER_PROFILE, ExtractConfig, DEFAULT_CONFIG
+                    diagnostic_dir=None) -> BolExtraction
+    BolProfile, BADGER_PROFILE, ExtractConfig, DEFAULT_CONFIG
 """
 
 from __future__ import annotations
@@ -45,8 +46,9 @@ from find_ship_to_bounds import (  # noqa: E402
     ocr_lines_with_sparse, find_anchor_signals, _aggregate, _line_text,
     DEFAULT_FUZZ_THRESHOLD,
 )
-from hbf_shipping.customer_address_map import (  # noqa: E402
-    Address, _normalize_address,
+from hbf_shipping.ship_to import (  # noqa: E402
+    NormalizedAddress, ShipTo, BolExtraction,
+    _normalize_address, _clean_name,
 )
 
 
@@ -637,49 +639,51 @@ def _clean_for_usps(s: str) -> str:
 
 
 # ============================================================
-# Street parsing (locate the street line among captured lines)
+# Walker-output classification (name / street / line_2)
 # ============================================================
 
 _STREET_DIGIT_RE = re.compile(r"^\s*\d+")
 _STREET_POBOX_RE = re.compile(r"^\s*p\.?\s*o\.?\s*box\b", re.IGNORECASE)
 
 
-def _parse_street_from_address_lines(address_lines: list[dict],
-                                     csz_line: dict) -> Optional[str]:
-    """From the captured address lines, pick the line that looks like a
-    street and return its Pub-28-cleaned text. Heuristic: leading digit
-    (street number) or 'P.O. Box' pattern. Excludes the CSZ line. Among
-    matches, prefer the one closest to (just above) CSZ."""
-    candidates: list[tuple[int, str]] = []
-    for ln in address_lines:
-        if ln is csz_line:
-            continue
+def _split_walker_lines(address_lines: list[dict], csz_line: dict
+                        ) -> tuple[list[dict], Optional[dict], list[dict]]:
+    """Partition walker-captured lines (excluding CSZ) into:
+        (name_lines, street_line, line_2_lines)
+
+    The street line is the BOTTOM-MOST (closest to CSZ) line whose
+    Pub-28-cleaned text starts with a digit (street number) or matches a
+    'P.O. Box' pattern. Lines above the street are name material;
+    lines between the street and CSZ are line_2 material (suite / ATTN /
+    building, etc.). Picking the bottom-most digit-line is robust to a
+    name that incidentally starts with a number ('1234 Holdings Inc.')
+    sitting above a real street.
+
+    Returns (all-as-name, None, []) when no street-y line is found. The
+    caller then surfaces this as a 'no street parsed' failure.
+    """
+    above = [ln for ln in address_lines if ln is not csz_line]
+    above_sorted = sorted(above, key=lambda ln: ln["y_top"])
+    street_idx: Optional[int] = None
+    for i, ln in enumerate(above_sorted):
         cleaned = _clean_for_usps(_line_text(ln))
         if not cleaned:
             continue
         if _STREET_DIGIT_RE.match(cleaned) or _STREET_POBOX_RE.match(cleaned):
-            candidates.append((ln["y_top"], cleaned))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda c: c[0])
-    return candidates[-1][1]
+            street_idx = i  # keep iterating to find the bottom-most match
+    if street_idx is None:
+        return above_sorted, None, []
+    return above_sorted[:street_idx], above_sorted[street_idx], above_sorted[street_idx + 1:]
 
 
 # ============================================================
 # Public API
 # ============================================================
 
-@dataclass(frozen=True)
-class ShipToResult:
-    pdf_path: Path
-    success: bool                           # True iff a usable Address was produced
-    failure_reason: Optional[str]           # human-readable why-it-failed; None on success
-    address: Optional[Address]              # normalized 4-tuple, None on failure
-    consignee_name: Optional[str]           # cleaned topmost OCR line above CSZ (facility/company name)
-    raw_lines: list[str]                    # captured OCR lines, top-down (CSZ last)
-    csz_line: Optional[str]                 # the CSZ row text, e.g. 'Tucson, AZ 85756'
-    diagnostic_path: Optional[Path]         # PNG path, only when diagnostic_dir was set
-    diagnostics: str                        # multi-line diagnostic dump (walker stop reason, line y-coords, column divider, etc.)
+
+def _empty_ship_to() -> ShipTo:
+    """ShipTo with all-None fields, source='bol'. Used on extraction failure."""
+    return ShipTo(name=None, name_candidates=[], address=None, source='bol')
 
 
 def extract_ship_to(
@@ -688,12 +692,13 @@ def extract_ship_to(
     profile: BolProfile = BADGER_PROFILE,
     config: ExtractConfig = DEFAULT_CONFIG,
     diagnostic_dir: Optional[Path] = None,
-) -> ShipToResult:
-    """Extract the SHIP TO address from a vendor BOL on page 2 of `pdf_path`.
+) -> BolExtraction:
+    """Extract the SHIP TO record from a vendor BOL on page 2 of `pdf_path`.
 
-    Returns a ShipToResult carrying the normalized Address, the raw captured
-    OCR lines for inspection, and (when `diagnostic_dir` is provided) the
-    path to an annotated PNG visualizing what the walker found.
+    Returns a BolExtraction carrying:
+      - a canonical ShipTo (name, name_candidates, NormalizedAddress, source)
+      - BOL-specific diagnostics: raw OCR lines, CSZ line text, optional
+        annotated PNG path, and a multi-line debug dump.
     """
     img = render_pdf_page(pdf_path, page_index=1, dpi=config.dpi)
     img = crop_to_document(img)
@@ -737,9 +742,10 @@ def extract_ship_to(
                 f"lower anchor ({lower_t!r}) was not matched in OCR. The "
                 f"upper anchor ({upper_t!r}) was found at y={upper_y}."
             )
-        return ShipToResult(
-            pdf_path=pdf_path, success=False, failure_reason=reason,
-            address=None, consignee_name=None,
+        return BolExtraction(
+            pdf_path=pdf_path,
+            ship_to=_empty_ship_to(),
+            success=False, failure_reason=reason,
             raw_lines=[], csz_line=None,
             diagnostic_path=None,
             diagnostics=f"FAIL: {reason}",
@@ -799,37 +805,74 @@ def extract_ship_to(
             f"OCR may have garbled the line, or it may sit outside the "
             f"expected vertical range."
         )
-        return ShipToResult(
-            pdf_path=pdf_path, success=False, failure_reason=reason,
-            address=None, consignee_name=None,
+        return BolExtraction(
+            pdf_path=pdf_path,
+            ship_to=_empty_ship_to(),
+            success=False, failure_reason=reason,
             raw_lines=[], csz_line=None,
             diagnostic_path=diagnostic_path,
             diagnostics=f"FAIL: {reason}\n{anchor_str}",
         )
 
-    # Step 5: USPS-normalize.
-    street = _parse_street_from_address_lines(address, csz)
-    addr: Optional[Address] = None
-    if street is not None:
-        addr = _normalize_address(street, csz["csz_city"], csz["csz_state"],
-                                  csz["csz_zip"])
+    # Step 5: classify walker output into name / street / line_2 components.
+    name_lines, street_line, line_2_lines = _split_walker_lines(address, csz)
+
+    # Step 6: build NormalizedAddress via scourgify, feeding it the street
+    # line plus any captured lines BETWEEN street and CSZ (these are
+    # typically suite/ATTN/building info that scourgify can place into
+    # address_line_2 properly).
+    addr: Optional[NormalizedAddress] = None
+    if street_line is not None:
+        street_text = _clean_for_usps(_line_text(street_line))
+        line_2_parts = [
+            _clean_for_usps(_line_text(ln)) for ln in line_2_lines
+        ]
+        line_2_parts = [p for p in line_2_parts if p]
+        line_2_text = " ".join(line_2_parts) if line_2_parts else None
+        addr = _normalize_address(
+            street_text,
+            csz["csz_city"], csz["csz_state"], csz["csz_zip"],
+            line_2=line_2_text,
+        )
+
+    # Step 7: name candidates — every walker line above the street, lightly
+    # cleaned (whitespace only; punctuation preserved for the name matcher).
+    name_candidates: list[str] = []
+    for ln in name_lines:
+        cleaned = _clean_name(_line_text(ln))
+        if cleaned:
+            name_candidates.append(cleaned)
+    name = name_candidates[0] if name_candidates else None
 
     raw_lines = [_line_text(ln) for ln in address]
     csz_text = f"{csz['csz_city']}, {csz['csz_state']} {csz['csz_zip']}"
 
-    # Topmost captured line (raw_lines[0]) is conventionally the
-    # facility/company name on Badger BOLs; CSZ sits at raw_lines[-1].
-    # Only populate when we got at least one line above CSZ.
-    consignee_name: Optional[str] = None
-    if len(raw_lines) >= 2:
-        cleaned = _clean_for_usps(raw_lines[0])
-        consignee_name = cleaned or None
+    ship_to = ShipTo(
+        name=name,
+        name_candidates=name_candidates,
+        address=addr,
+        source='bol',
+    )
 
     line_strs = [f"  {i+1}. y=[{ln['y_top']:4d}-{ln['y_bot']:4d}]  {_line_text(ln)!r}"
                  for i, ln in enumerate(address)]
     summary = (f"CSZ {csz['csz_city']!r}, {csz['csz_state']} {csz['csz_zip']}  "
                f"({len(address)} address lines, stop: {stop_reason})")
-    addr_str = f"\n  ADDRESS  {addr}" if addr is not None else "\n  ADDRESS  None (no street parsed)"
+    classification = (
+        f"  CLASSIFY  name_lines={len(name_lines)}  "
+        f"street_line={'yes' if street_line is not None else 'no'}  "
+        f"line_2_lines={len(line_2_lines)}"
+    )
+    name_str = (
+        f"\n  NAME      {name!r}" if name is not None else "\n  NAME      None"
+    )
+    name_cands_str = (
+        f"\n  NAME_CAND {name_candidates}" if name_candidates else "\n  NAME_CAND []"
+    )
+    addr_str = (
+        f"\n  ADDRESS   {addr}" if addr is not None
+        else "\n  ADDRESS   None (no street parsed)"
+    )
 
     failure_reason: Optional[str] = None
     if addr is None:
@@ -847,11 +890,15 @@ def extract_ship_to(
                 f"lines were captured above it; cannot extract a street address."
             )
 
-    return ShipToResult(
-        pdf_path=pdf_path, success=(addr is not None),
+    return BolExtraction(
+        pdf_path=pdf_path,
+        ship_to=ship_to,
+        success=(addr is not None),
         failure_reason=failure_reason,
-        address=addr, consignee_name=consignee_name,
-        raw_lines=raw_lines, csz_line=csz_text,
+        raw_lines=raw_lines,
+        csz_line=csz_text,
         diagnostic_path=diagnostic_path,
-        diagnostics=summary + "\n" + "\n".join(line_strs) + "\n" + anchor_str + addr_str,
+        diagnostics=(summary + "\n" + "\n".join(line_strs) + "\n"
+                     + classification + "\n" + anchor_str
+                     + name_str + name_cands_str + addr_str),
     )

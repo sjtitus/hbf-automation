@@ -2,15 +2,23 @@
 Loader for the customer-address master list.
 
 Reads `data/hbf-customer-shipping-addresses.xlsx` and returns a map from
-`Address` (street + city + state + postcode) to a list of `CustomerEntry`
-(`name` from the `Name` column, `line_1_clean` derived from `AddressLine1`
-per the dash rule below).
+`NormalizedAddress` (street + line_2 + city + state + postcode) to a list
+of `CustomerEntry` (`name` from the `Name` column, `line_1_clean` derived
+from `AddressLine1` per the dash rule below).
 
-A single Address can hold multiple CustomerEntries — many HBF customer
-sites share a physical address (e.g., the Butner federal complex serves
-seven customer entities at one address). Phase 2 lookup will key on the
-same Address shape, so this map drops in directly once PDFs surface
-structured address fields.
+A single NormalizedAddress can hold multiple CustomerEntries — many HBF
+customer sites share a physical address (e.g., the Butner federal complex
+serves seven customer entities at one address).
+
+The address shape (`NormalizedAddress`) is the canonical 5-field type
+defined in `hbf_shipping.ship_to`; the same shape is produced by both
+the page-1 invoice ShipTo extractor and the page-2 BOL ShipTo extractor,
+so all three sources speak one address vocabulary.
+
+NOTE (stage 1): the matching logic below predates the 5-field address
+shape; `line_2` is currently captured but ignored at match time. The
+next-stage refactor will make `line_2` a real participant in matching
+(suite/unit-aware customer disambiguation).
 
 Per `AddressLine1` interpretation:
   - Take text **before the first `-`**, whitespace-stripped.
@@ -32,20 +40,25 @@ from typing import Union
 
 from openpyxl import load_workbook
 from rapidfuzz import fuzz
-from scourgify import normalize_address_record
+
+from .ship_to import (
+    NormalizedAddress,
+    _normalize_address,
+    _norm,
+    _fmt_postcode,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-Address = namedtuple('Address', 'street city state postcode')
 CustomerEntry = namedtuple('CustomerEntry', 'name line_1_clean')
 LookupResult = namedtuple(
     'LookupResult',
     'pairs cm_method addr_score name_method name_score',
 )
-# pairs:       list[(Address, CustomerEntry)] — match output, OR best near-miss
-#              on no_match / multi_match_unresolved.
+# pairs:       list[(NormalizedAddress, CustomerEntry)] — match output, OR
+#              best near-miss on no_match / multi_match_unresolved.
 # cm_method:   one of:
 #                'address_exact'                — exact address hit, single match
 #                'address_fuzzy'                — fuzzy address hit, single match
@@ -93,49 +106,6 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ADDRESS_FILE = _PROJECT_ROOT / 'data' / 'hbf-customer-shipping-addresses.xlsx'
 
 
-def _norm(value) -> str:
-    """Upper + strip + collapse internal whitespace. None/empty → ''."""
-    if value is None:
-        return ''
-    return re.sub(r'\s+', ' ', str(value).strip().upper())
-
-
-def _normalize_address(street, city, state, postcode) -> Address:
-    """Normalize the four address components via usaddress-scourgify, which
-    applies USPS Publication 28 rules (suffix abbreviations like
-    Rd↔Road, directional collapsing W↔West, punctuation stripping,
-    suite/unit splitting). Returns an Address tuple ready to use as a
-    dict key.
-
-    Falls back to plain `_norm` + `_fmt_postcode` if scourgify can't parse
-    the input — better to have an unnormalized key than no key at all.
-    """
-    addr_dict = {
-        'address_line_1': str(street).strip() if street else '',
-        'address_line_2': '',
-        'city':           str(city).strip()   if city   else '',
-        'state':          str(state).strip()  if state  else '',
-        'postal_code':    _fmt_postcode(postcode),
-    }
-    try:
-        r = normalize_address_record(addr_dict)
-        return Address(
-            street=(r.get('address_line_1') or '').upper(),
-            city=(r.get('city') or '').upper(),
-            state=(r.get('state') or '').upper(),
-            postcode=r.get('postal_code') or '',
-        )
-    except Exception as e:
-        logger.debug("scourgify failed for %r: %s — falling back to plain normalization",
-                     addr_dict, e)
-        return Address(
-            street=_norm(street),
-            city=_norm(city),
-            state=_norm(state),
-            postcode=_fmt_postcode(postcode),
-        )
-
-
 def _clean_line_1(al1) -> str:
     """Per dash rule: pre-dash text whitespace-stripped, or whole AL1 if
     no dash. Result is normalized."""
@@ -147,24 +117,13 @@ def _clean_line_1(al1) -> str:
     return _norm(s)
 
 
-def _fmt_postcode(pc) -> str:
-    """5-digit zero-padded string for numeric cells (preserves leading
-    zeros), pass-through stripped string for text cells, '' for empty."""
-    if pc is None or pc == '':
-        return ''
-    if isinstance(pc, (int, float)):
-        n = int(pc)
-        return f'{n:05d}' if n else ''
-    return str(pc).strip()
-
-
 def load_address_to_customers(
     xlsx_path: Union[str, Path, None] = None,
 ) -> dict:
-    """Load the customer-address XLSX and return dict[Address, list[CustomerEntry]].
+    """Load the customer-address XLSX and return dict[NormalizedAddress, list[CustomerEntry]].
 
     Rows missing City, State, or Postcode are skipped (logged at debug).
-    Same Address with multiple rows → list grows.
+    Same NormalizedAddress with multiple rows → list grows.
     """
     path = Path(xlsx_path) if xlsx_path else DEFAULT_ADDRESS_FILE
     wb = load_workbook(filename=str(path), data_only=True, read_only=True)
@@ -238,8 +197,8 @@ def _normalize_name(name: str) -> str:
     return re.sub(r'\s+', ' ', s).strip()
 
 
-def _build_pairs_at_address(addr: Address, entries) -> list:
-    """Helper: explode a single Address + entry list into pair tuples."""
+def _build_pairs_at_address(addr: NormalizedAddress, entries) -> list:
+    """Helper: explode a single NormalizedAddress + entry list into pair tuples."""
     return [(addr, e) for e in entries]
 
 
