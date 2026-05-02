@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .bol_ship_to import extract_ship_to
+from .customer_address_map import load_address_to_customers
 from .run_logging import invoice_logger
 
 
@@ -76,9 +77,16 @@ def _agree_name(a: str | None, b: str | None) -> str:
 
 
 class Pipeline:
-    """Stage 1: parse + extract ShipTo (page-1 and BOL) + log summary."""
+    """Stage 1: parse + extract ShipTo (page-1 and BOL) + log summary.
 
-    def __init__(self, vendor, run_id: str, run_dir: Path):
+    Also runs customer-master validation at startup. With
+    `strict_master=True`, any hard-rule violation aborts via
+    `MasterValidationError`. The validation report is always written to
+    `<run_dir>/customer_master_validation.log`.
+    """
+
+    def __init__(self, vendor, run_id: str, run_dir: Path,
+                 strict_master: bool = False):
         self.vendor = vendor
         self.run_id = run_id
         self.run_dir = run_dir
@@ -86,6 +94,12 @@ class Pipeline:
         self.results: list[tuple[Path, object, object]] = []
         self.batch_started: str | None = None
         self.batch_ended: str | None = None
+
+        # Load + validate the customer master at startup. Validation log
+        # lands in run_dir; strict mode propagates via MasterValidationError.
+        self.address_map = load_address_to_customers(
+            strict=strict_master, log_dir=run_dir,
+        )
 
     def process_invoice(self, pdf_path) -> bool:
         """Run page-1 + BOL ShipTo extraction on one PDF. Logs a summary

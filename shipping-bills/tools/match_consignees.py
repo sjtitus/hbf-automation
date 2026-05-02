@@ -39,7 +39,7 @@ def print_pairs(pairs):
     for i, (addr, e) in enumerate(pairs, 1):
         print(f"      [{i}] {e.name}")
         print(f"          address      : {fmt_addr(addr)}")
-        print(f"          line_1_clean : {e.line_1_clean!r}")
+        print(f"          shipto_name  : {e.shipto_name!r}")
 
 
 def main() -> int:

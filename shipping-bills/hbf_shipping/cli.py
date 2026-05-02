@@ -12,8 +12,10 @@ Run from the project root — output directory (logs/) is CWD-relative.
 """
 
 import argparse
+import sys
 from pathlib import Path
 
+from .customer_address_map import MasterValidationError
 from .pipeline import Pipeline
 from .run_logging import setup_run
 from .vendors import VENDORS
@@ -57,13 +59,32 @@ Examples:
             'extracted from page 1 (text) and page 2 (BOL OCR).'
         ),
     )
+    parser.add_argument(
+        '--strict-master',
+        action='store_true',
+        help=(
+            'Treat hard-rule violations in the customer-master XLSX as '
+            'fatal: abort startup with a non-zero exit if any are found. '
+            'The validation report is always written to '
+            '<run-dir>/customer_master_validation.log regardless of this '
+            'flag; default behavior is to log violations and continue.'
+        ),
+    )
 
     args = parser.parse_args()
 
     run_id, run_dir = setup_run(args.vendor)
 
     vendor = VENDORS[args.vendor]
-    pipeline = Pipeline(vendor, run_id=run_id, run_dir=run_dir)
+    try:
+        pipeline = Pipeline(
+            vendor, run_id=run_id, run_dir=run_dir,
+            strict_master=args.strict_master,
+        )
+    except MasterValidationError as e:
+        print(f"\nERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
     pipeline.process_batch(args.invoice_dir)
     pipeline.report()
 

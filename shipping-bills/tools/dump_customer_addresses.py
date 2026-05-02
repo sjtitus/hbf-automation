@@ -42,7 +42,7 @@ def main() -> int:
         print(f"  {addr.street}")
         print(f"  {addr.city}, {addr.state} {addr.postcode}")
         for e in entries:
-            print(f"    -> {e.name}   [line_1_clean={e.line_1_clean}]")
+            print(f"    -> {e.name}   [shipto_name={e.shipto_name}]")
         print()
 
     # Multi-customer addresses

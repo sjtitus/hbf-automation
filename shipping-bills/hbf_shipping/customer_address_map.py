@@ -1,33 +1,35 @@
 """
-Loader for the customer-address master list.
+Loader and validator for the customer-address master list.
 
 Reads `data/hbf-customer-shipping-addresses.xlsx` and returns a map from
-`NormalizedAddress` (street + line_2 + city + state + postcode) to a list
-of `CustomerEntry` (`name` from the `Name` column, `line_1_clean` derived
-from `AddressLine1` per the dash rule below).
+`NormalizedAddress` (street + line_2 + city + state + postcode) to a
+list of `CustomerEntry` (`name` from the `Name` column, `shipto_name`
+derived from `AddressLine1` via the new `parse_al1` parser).
 
-A single NormalizedAddress can hold multiple CustomerEntries — many HBF
-customer sites share a physical address (e.g., the Butner federal complex
-serves seven customer entities at one address).
+**Schema model** (per the human-maintained source file):
+  - `Name`         = the **Customer** (billing entity).
+  - `AddressLine1` = `<shipping-name-info> - <hbf customer number>[<sep><additional-info>]`
+                     where `<sep>` is `,` and/or whitespace (comma optional).
+                     For no-dash rows, the entire AL1 is the shipping name.
+  - `AddressLine2` = the actual street.
+  - `City`/`State`/`Postcode` = standard.
 
-The address shape (`NormalizedAddress`) is the canonical 5-field type
-defined in `hbf_shipping.ship_to`; the same shape is produced by both
-the page-1 invoice ShipTo extractor and the page-2 BOL ShipTo extractor,
-so all three sources speak one address vocabulary.
+A single canonical address can hold many customers (multi-tenant sites
+like federal complexes); a single Customer can have many addresses
+(distributors with multiple ship-to locations); the row-level uniqueness
+invariant is `(Name, normalized shipto_name, NormalizedAddress)`.
+
+**Validation phase** runs at load time. Hard-rule violations
+(missing required fields, duplicate triples) are reported and — when
+`strict=True` — abort the load via `MasterValidationError`. Soft-rule
+warnings (AL1 strict-parse failure, no-dash AL1, scourgify-fallback
+addresses) are reported but never abort. A human-readable validation
+log file is written to `<log_dir>/customer_master_validation.log` when
+`log_dir` is provided.
 
 NOTE (stage 1): the matching logic below predates the 5-field address
-shape; `line_2` is currently captured but ignored at match time. The
-next-stage refactor will make `line_2` a real participant in matching
-(suite/unit-aware customer disambiguation).
-
-Per `AddressLine1` interpretation:
-  - Take text **before the first `-`**, whitespace-stripped.
-  - If `AddressLine1` has no `-`, use the whole field, whitespace-stripped.
-  - Result is then normalized (upper + collapsed whitespace) for matching.
-
-Per skip rule: any row missing `City`, `State`, or `Postcode` is excluded
-from the map (won't be available for address-based matching). A debug log
-records the count and reason.
+shape; `line_2` is captured but ignored at match time. Stage-2 makes it
+a real participant.
 """
 
 from __future__ import annotations
@@ -35,8 +37,10 @@ from __future__ import annotations
 import logging
 import re
 from collections import namedtuple
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from openpyxl import load_workbook
 from rapidfuzz import fuzz
@@ -44,6 +48,7 @@ from rapidfuzz import fuzz
 from .ship_to import (
     NormalizedAddress,
     _normalize_address,
+    _normalize_address_with_status,
     _norm,
     _fmt_postcode,
 )
@@ -52,7 +57,11 @@ from .ship_to import (
 logger = logging.getLogger(__name__)
 
 
-CustomerEntry = namedtuple('CustomerEntry', 'name line_1_clean')
+# `name` from the Name column; `shipto_name` is the parsed shipping-name
+# portion of AL1 (the pre-dash text for dash rows, full AL1 for no-dash
+# rows). For non-distributors the two are typically equivalent modulo
+# minor naming variations; for distributors they genuinely differ.
+CustomerEntry = namedtuple('CustomerEntry', 'name shipto_name')
 LookupResult = namedtuple(
     'LookupResult',
     'pairs cm_method addr_score name_method name_score',
@@ -106,68 +115,432 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ADDRESS_FILE = _PROJECT_ROOT / 'data' / 'hbf-customer-shipping-addresses.xlsx'
 
 
-def _clean_line_1(al1) -> str:
-    """Per dash rule: pre-dash text whitespace-stripped, or whole AL1 if
-    no dash. Result is normalized."""
+# AL1 format (per source-file convention):
+#   <shipping-name-info> - <hbf customer number>[<sep><additional-info>]
+# where <sep> is `,` and/or whitespace (comma optional).
+# Last `\s+-\s*<digits>` wins (greedy `.+`), so internal-dash names like
+# "Avery-Mitchell Corr. Inst." are preserved. Whitespace required BEFORE
+# the dash so internal hyphens don't false-match.
+_AL1_PARSE_RE = re.compile(r'^(.+)\s+-\s*(\d+)(?:[\s,]+(.*?))?\s*$')
+
+# Detects the customer-number separator pattern: whitespace before a
+# dash. This distinguishes a real separator from internal hyphens like
+# 'GSNA-Jekyll' or 'Cash-WA Distributing' (which have NO whitespace
+# before the dash). Permissive about what follows the dash so rows
+# like 'Center -205997' (missing space after dash) are still recognized
+# as customer-number attempts. A row WITHOUT this pattern is treated as
+# a no-customer-number row regardless of internal hyphens.
+_CUSTOMER_NUM_SEP_RE = re.compile(r'\s+-')
+
+
+def parse_al1(al1) -> tuple[str, Optional[str], Optional[str], bool]:
+    """Parse an AL1 cell.
+
+    Returns `(shipping_name, customer_number, additional_info, parsed_ok)`:
+      - dash row matching the format → all four populated, parsed_ok=True.
+      - no-customer-number row (no customer-number separator pattern, OR
+        internal-hyphens-only) → (al1.strip(), None, None, True). Whole
+        AL1 is the shipping name; parse considered successful.
+      - dash row with the separator pattern that doesn't strict-parse →
+        (al1.strip(), None, None, False). Validation flags these.
+      - empty / None input → ('', None, None, True).
+    """
     if al1 is None:
-        return ''
-    s = str(al1)
-    if '-' in s:
-        s = s.split('-', 1)[0]
-    return _norm(s)
+        return '', None, None, True
+    s = str(al1).strip()
+    if not s:
+        return '', None, None, True
+
+    # No customer-number separator pattern → treat as no-customer-number
+    # row regardless of any internal hyphens within words. The whole AL1
+    # is the shipping name. (E.g. 'ABF Freight c/o PeakXpo GSNA-Jekyll
+    # Island' — only dash is internal in 'GSNA-Jekyll'.)
+    if not _CUSTOMER_NUM_SEP_RE.search(s):
+        return s, None, None, True
+
+    m = _AL1_PARSE_RE.match(s)
+    if not m:
+        return s, None, None, False
+
+    name = m.group(1).strip()
+    number = m.group(2)
+    extra = (m.group(3) or '').strip() or None
+    return name, number, extra, True
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+
+class MasterValidationError(Exception):
+    """Raised when `load_address_to_customers(strict=True)` finds at least
+    one hard-rule violation in the customer master."""
+
+
+@dataclass(frozen=True)
+class ValidationViolation:
+    row: int          # 1-indexed XLSX row (header is row 1, data starts row 2)
+    rule: str         # rule identifier — one of the RULE_ keys below
+    severity: str     # 'hard' | 'soft'
+    message: str      # human-readable explanation
+    raw: dict         # row data: {Name, AddressLine1, AddressLine2, City, State, Postcode}
+
+
+# Rule identifiers — kept as constants so the report has a stable
+# vocabulary and tests can refer to them.
+RULE_REQUIRED_FIELDS  = 'required_fields_present'    # hard
+RULE_TRIPLE_UNIQUE    = 'triple_unique'              # hard
+RULE_AL1_STRICT_PARSE = 'al1_strict_parse'           # soft
+RULE_NO_DASH_AL1      = 'no_dash_al1'                # soft
+RULE_SCOURGIFY_FALL   = 'scourgify_fallback'         # soft
+
+_HARD_RULES = {RULE_REQUIRED_FIELDS, RULE_TRIPLE_UNIQUE}
+
+
+# Per-row record built by the loader, consumed by validation.
+@dataclass(frozen=True)
+class _RowRecord:
+    row: int                              # 1-indexed XLSX row
+    raw: dict                             # original cell values
+    shipto_name: str                      # parsed AL1 shipping name
+    customer_number: Optional[str]
+    al1_extra: Optional[str]
+    al1_parsed_ok: bool                   # AL1 strict-parse status
+    address: Optional[NormalizedAddress]  # None if CSZ missing
+    address_used_fallback: bool           # scourgify fell back to plain norm
+
+
+def validate_master(records: list[_RowRecord]) -> list[ValidationViolation]:
+    """Run all validation rules over the loaded row records and return
+    the consolidated violation list. Rules are applied independently;
+    each rule's violations are accumulated in input row order.
+    """
+    violations: list[ValidationViolation] = []
+    violations.extend(_check_required_fields(records))
+    violations.extend(_check_triple_unique(records))
+    violations.extend(_check_al1_strict_parse(records))
+    violations.extend(_check_no_dash_al1(records))
+    violations.extend(_check_scourgify_fallback(records))
+    violations.sort(key=lambda v: (v.row, v.rule))
+    return violations
+
+
+def _check_required_fields(records: list[_RowRecord]) -> list[ValidationViolation]:
+    """Hard rule: Name, AddressLine1, AddressLine2, City, State, Postcode
+    must all be non-empty."""
+    out = []
+    for r in records:
+        missing = []
+        for field in ('Name', 'AddressLine1', 'AddressLine2',
+                      'City', 'State', 'Postcode'):
+            v = r.raw.get(field)
+            if v is None or (isinstance(v, str) and not v.strip()):
+                missing.append(field)
+        if missing:
+            out.append(ValidationViolation(
+                row=r.row, rule=RULE_REQUIRED_FIELDS, severity='hard',
+                message=f"missing required field(s): {missing}",
+                raw=r.raw,
+            ))
+    return out
+
+
+def _check_triple_unique(records: list[_RowRecord]) -> list[ValidationViolation]:
+    """Hard rule: `(Name, normalized shipto_name, NormalizedAddress)` is
+    unique across all rows. Skip rows whose address couldn't be built
+    (missing CSZ) — those are already flagged by required_fields."""
+    seen: dict[tuple, int] = {}
+    out = []
+    for r in records:
+        if r.address is None:
+            continue
+        name = (r.raw.get('Name') or '').strip()
+        if not name:
+            continue
+        key = (name, _normalize_name(r.shipto_name), r.address)
+        prev = seen.get(key)
+        if prev is not None:
+            out.append(ValidationViolation(
+                row=r.row, rule=RULE_TRIPLE_UNIQUE, severity='hard',
+                message=(f"duplicate (Name={name!r}, "
+                         f"shipto_name={r.shipto_name!r}, address) — "
+                         f"first seen at row {prev}"),
+                raw=r.raw,
+            ))
+        else:
+            seen[key] = r.row
+    return out
+
+
+def _check_al1_strict_parse(records: list[_RowRecord]) -> list[ValidationViolation]:
+    """Soft rule: AL1 that uses the customer-number separator pattern
+    (whitespace-dash) should strict-parse to a clean
+    `<name> - <digits>[<sep><extra>]`. Flags rows that LOOK like
+    they're trying to have a customer number but the format is wrong
+    (Lompoc-style missing dash before number, `#`-prefix on number,
+    orphan `- C` suffix, etc.). Rows with no customer-number separator
+    pattern (only internal hyphens or no dash at all) are flagged by
+    the no-customer-number rule instead, not here.
+    """
+    out = []
+    for r in records:
+        al1 = r.raw.get('AddressLine1')
+        if al1 is None:
+            continue
+        s = str(al1)
+        if not _CUSTOMER_NUM_SEP_RE.search(s):
+            continue  # no separator pattern → not this rule's concern
+        if not r.al1_parsed_ok:
+            out.append(ValidationViolation(
+                row=r.row, rule=RULE_AL1_STRICT_PARSE, severity='soft',
+                message=(f"AL1 has a customer-number separator but "
+                         f"doesn't match expected format: {al1!r}"),
+                raw=r.raw,
+            ))
+    return out
+
+
+def _check_no_dash_al1(records: list[_RowRecord]) -> list[ValidationViolation]:
+    """Soft rule: AL1 with no customer-number separator pattern (no
+    `\\s+-\\s` anywhere). Includes both true no-dash rows and rows
+    whose only dashes are internal hyphens within words (e.g.,
+    'ABF Freight c/o PeakXpo GSNA-Jekyll Island'). Flags the row for
+    human review; legitimate no-customer-number rows are fine to
+    ignore.
+    """
+    out = []
+    for r in records:
+        al1 = r.raw.get('AddressLine1')
+        if al1 is None:
+            continue
+        if not _CUSTOMER_NUM_SEP_RE.search(str(al1)):
+            out.append(ValidationViolation(
+                row=r.row, rule=RULE_NO_DASH_AL1, severity='soft',
+                message=f"AL1 has no customer number assigned: {al1!r}",
+                raw=r.raw,
+            ))
+    return out
+
+
+def _check_scourgify_fallback(records: list[_RowRecord]) -> list[ValidationViolation]:
+    """Soft rule: address didn't parse via scourgify; loader fell back
+    to plain whitespace-collapse + uppercase. May create asymmetric
+    matching against an OCR-extracted invoice address that DOES parse."""
+    out = []
+    for r in records:
+        if r.address_used_fallback and r.address is not None:
+            al2 = r.raw.get('AddressLine2')
+            out.append(ValidationViolation(
+                row=r.row, rule=RULE_SCOURGIFY_FALL, severity='soft',
+                message=(f"scourgify could not parse the street; using "
+                         f"plain norm fallback. AL2={al2!r} → "
+                         f"street={r.address.street!r}"),
+                raw=r.raw,
+            ))
+    return out
+
+
+def write_validation_report(
+    violations: list[ValidationViolation],
+    *,
+    source_path: Path,
+    total_rows: int,
+    log_path: Path,
+    strict: bool,
+    aborted: bool = False,
+) -> None:
+    """Write a human-readable validation report to `log_path`. Always
+    overwrites. Sections per rule, row-by-row entries, summary footer.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Group by rule, preserving sort-by-row order within each group.
+    by_rule: dict[str, list[ValidationViolation]] = {}
+    for v in violations:
+        by_rule.setdefault(v.rule, []).append(v)
+
+    n_hard = sum(1 for v in violations if v.severity == 'hard')
+    n_soft = sum(1 for v in violations if v.severity == 'soft')
+
+    if aborted:
+        verdict = 'FAIL (aborted via --strict-master)'
+    elif n_hard > 0 and strict:
+        verdict = 'FAIL'
+    elif n_hard > 0:
+        verdict = (f'PASS with {n_hard} hard violation(s) '
+                   f'(non-strict mode; would FAIL with --strict-master)')
+    else:
+        verdict = 'PASS'
+
+    lines = []
+    lines.append("HBF Customer Master Validation Report")
+    lines.append("=" * 78)
+    lines.append(f"Generated:   {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"Source:      {source_path}")
+    lines.append(f"Total rows:  {total_rows}")
+    lines.append(f"Mode:        {'strict (hard violations are fatal)' if strict else 'non-strict (failures logged, run continues)'}")
+    lines.append("")
+
+    rule_specs = [
+        (RULE_REQUIRED_FIELDS, 'hard', 'Required fields non-empty'),
+        (RULE_TRIPLE_UNIQUE,   'hard', 'Triple uniqueness (Name, shipto_name, address)'),
+        (RULE_AL1_STRICT_PARSE,'soft', 'AL1 strict-parse failure'),
+        (RULE_NO_DASH_AL1,     'soft', 'AL1 has no customer number assigned'),
+        (RULE_SCOURGIFY_FALL,  'soft', 'Scourgify-fallback addresses'),
+    ]
+
+    lines.append("=== HARD RULES ===")
+    lines.append("")
+    for rule, severity, label in rule_specs:
+        if severity != 'hard':
+            continue
+        viols = by_rule.get(rule, [])
+        status = 'FAIL' if viols else 'OK'
+        lines.append(f"[{status}] {label}  [rule={rule}]  ({len(viols)} violation(s))")
+        for v in viols:
+            lines.append(f"  row {v.row:3d}: {v.message}")
+        lines.append("")
+
+    lines.append("=== SOFT RULES (warnings) ===")
+    lines.append("")
+    for rule, severity, label in rule_specs:
+        if severity != 'soft':
+            continue
+        viols = by_rule.get(rule, [])
+        status = 'WARN' if viols else 'OK'
+        lines.append(f"[{status}] {label}  [rule={rule}]  ({len(viols)} entries)")
+        for v in viols:
+            lines.append(f"  row {v.row:3d}: {v.message}")
+        lines.append("")
+
+    lines.append("=== SUMMARY ===")
+    lines.append(f"Hard violations: {n_hard}")
+    lines.append(f"Soft warnings:   {n_soft}")
+    lines.append(f"Verdict:         {verdict}")
+    lines.append("")
+
+    log_path.write_text('\n'.join(lines), encoding='utf-8')
+
+
+# ============================================================
+# Loader
+# ============================================================
 
 
 def load_address_to_customers(
     xlsx_path: Union[str, Path, None] = None,
+    *,
+    strict: bool = False,
+    log_dir: Union[str, Path, None] = None,
 ) -> dict:
-    """Load the customer-address XLSX and return dict[NormalizedAddress, list[CustomerEntry]].
+    """Load the customer-address XLSX and return
+    `dict[NormalizedAddress, list[CustomerEntry]]`.
 
-    Rows missing City, State, or Postcode are skipped (logged at debug).
-    Same NormalizedAddress with multiple rows → list grows.
+    Validation runs at load time. When `log_dir` is provided, a
+    human-readable report is written to
+    `<log_dir>/customer_master_validation.log`. When `strict=True`, any
+    hard-rule violation aborts the load via `MasterValidationError`
+    (the report is still written first so the human can see what
+    failed).
+
+    Rows with hard `required_fields_present` violations are excluded
+    from the returned dict — they're not usable for matching anyway.
+    All other rows are included.
     """
     path = Path(xlsx_path) if xlsx_path else DEFAULT_ADDRESS_FILE
+    log_dir_path = Path(log_dir) if log_dir is not None else None
+
     wb = load_workbook(filename=str(path), data_only=True, read_only=True)
     try:
         ws = wb.active
+        records: list[_RowRecord] = []
 
-        result: dict = {}
-        skipped = 0
-        total = 0
-
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
             if row is None:
                 continue
             cells = list(row) + [None] * (6 - len(row))
             name, al1, al2, city, state, pc = cells[:6]
 
             if name is None and al1 is None and al2 is None:
-                continue
-            total += 1
+                continue  # truly empty row — skip
 
+            raw = {
+                'Name': name, 'AddressLine1': al1, 'AddressLine2': al2,
+                'City': city, 'State': state, 'Postcode': pc,
+            }
+
+            shipto_name, cust_num, al1_extra, al1_ok = parse_al1(al1)
+
+            # Build address only when CSZ is present (else it's a
+            # required-fields violation and address can't be keyed).
             city_n = _norm(city)
             state_n = _norm(state)
             pc_n = _fmt_postcode(pc)
+            if city_n and state_n and pc_n and al2 is not None:
+                addr, used_fallback = _normalize_address_with_status(al2, city, state, pc)
+            else:
+                addr = None
+                used_fallback = False
 
-            if not city_n or not state_n or not pc_n:
-                skipped += 1
-                logger.debug(
-                    "skip name=%r — missing city/state/postcode (city=%r state=%r postcode=%r)",
-                    name, city, state, pc,
-                )
-                continue
-
-            addr = _normalize_address(al2, city, state, pc)
-            entry = CustomerEntry(
-                name=str(name).strip() if name is not None else '',
-                line_1_clean=_clean_line_1(al1),
-            )
-            result.setdefault(addr, []).append(entry)
+            records.append(_RowRecord(
+                row=row_idx, raw=raw,
+                shipto_name=shipto_name, customer_number=cust_num,
+                al1_extra=al1_extra, al1_parsed_ok=al1_ok,
+                address=addr, address_used_fallback=used_fallback,
+            ))
     finally:
         wb.close()
 
-    logger.debug(
-        "loaded %d unique addresses (%d total rows, %d skipped for missing city/state/postcode)",
-        len(result), total, skipped,
+    violations = validate_master(records)
+    n_hard = sum(1 for v in violations if v.severity == 'hard')
+    n_soft = sum(1 for v in violations if v.severity == 'soft')
+
+    aborting = strict and n_hard > 0
+
+    if log_dir_path is not None:
+        log_path = log_dir_path / 'customer_master_validation.log'
+        write_validation_report(
+            violations,
+            source_path=path,
+            total_rows=len(records),
+            log_path=log_path,
+            strict=strict,
+            aborted=aborting,
+        )
+        if n_hard > 0 or n_soft > 0:
+            logger.warning(
+                "customer-master validation: %d hard, %d soft (see %s)",
+                n_hard, n_soft, log_path,
+            )
+
+    if aborting:
+        raise MasterValidationError(
+            f"customer master has {n_hard} hard validation violation(s) — "
+            f"see {log_dir_path / 'customer_master_validation.log' if log_dir_path else '<log not written>'}"
+        )
+
+    # Build the result, excluding rows with required-fields violations.
+    rows_with_required_violation: set[int] = {
+        v.row for v in violations if v.rule == RULE_REQUIRED_FIELDS
+    }
+
+    result: dict = {}
+    for r in records:
+        if r.row in rows_with_required_violation:
+            continue
+        if r.address is None:
+            continue
+        entry = CustomerEntry(
+            name=str(r.raw['Name']).strip() if r.raw['Name'] is not None else '',
+            shipto_name=r.shipto_name,
+        )
+        result.setdefault(r.address, []).append(entry)
+
+    logger.info(
+        "loaded customer master: %d unique addresses from %d rows "
+        "(%d hard violations, %d soft warnings)",
+        len(result), len(records), n_hard, n_soft,
     )
     return result
 

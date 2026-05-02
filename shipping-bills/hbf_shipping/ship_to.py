@@ -124,20 +124,12 @@ def _fmt_postcode(pc) -> str:
     return str(pc).strip()
 
 
-def _normalize_address(street, city, state, postcode, line_2=None) -> NormalizedAddress:
-    """Normalize address components via usaddress-scourgify, which applies
-    USPS Publication 28 rules (suffix abbreviations like Rd↔Road,
-    directional collapsing W↔West, punctuation stripping, suite/unit
-    splitting). Returns a 5-field NormalizedAddress.
-
-    Both `street` and (optionally) `line_2` are passed to scourgify. When
-    suite/unit information already lives on its own line (caller has
-    pre-split it), pass it as `line_2`. When it's mixed into the street
-    string, scourgify will split it into `address_line_2` automatically.
-    Either way the returned NormalizedAddress carries it in `line_2`.
-
-    Falls back to plain `_norm` + `_fmt_postcode` if scourgify can't parse
-    the input — better to have an unnormalized key than no key at all.
+def _normalize_address_with_status(
+    street, city, state, postcode, line_2=None,
+) -> tuple[NormalizedAddress, bool]:
+    """Like `_normalize_address` but also returns a `used_fallback` flag.
+    `used_fallback=True` means scourgify failed to parse and we fell back
+    to plain `_norm` + `_fmt_postcode`. Useful for validation reporting.
     """
     addr_dict = {
         'address_line_1': str(street).strip() if street else '',
@@ -154,7 +146,7 @@ def _normalize_address(street, city, state, postcode, line_2=None) -> Normalized
             city=(r.get('city') or '').upper(),
             state=(r.get('state') or '').upper(),
             postcode=r.get('postal_code') or '',
-        )
+        ), False
     except Exception as e:
         logger.debug("scourgify failed for %r: %s — falling back to plain normalization",
                      addr_dict, e)
@@ -164,7 +156,28 @@ def _normalize_address(street, city, state, postcode, line_2=None) -> Normalized
             city=_norm(city),
             state=_norm(state),
             postcode=_fmt_postcode(postcode),
-        )
+        ), True
+
+
+def _normalize_address(street, city, state, postcode, line_2=None) -> NormalizedAddress:
+    """Normalize address components via usaddress-scourgify, which applies
+    USPS Publication 28 rules (suffix abbreviations like Rd↔Road,
+    directional collapsing W↔West, punctuation stripping, suite/unit
+    splitting). Returns a 5-field NormalizedAddress.
+
+    Both `street` and (optionally) `line_2` are passed to scourgify. When
+    suite/unit information already lives on its own line (caller has
+    pre-split it), pass it as `line_2`. When it's mixed into the street
+    string, scourgify will split it into `address_line_2` automatically.
+    Either way the returned NormalizedAddress carries it in `line_2`.
+
+    Falls back to plain `_norm` + `_fmt_postcode` if scourgify can't parse
+    the input — better to have an unnormalized key than no key at all.
+    Use `_normalize_address_with_status` if you need to know whether
+    fallback was used.
+    """
+    addr, _ = _normalize_address_with_status(street, city, state, postcode, line_2)
+    return addr
 
 
 _LEADING_DOT_OR_SPACE_RE = re.compile(r'^[\s.]+')
@@ -293,6 +306,7 @@ __all__ = [
     '_norm',
     '_fmt_postcode',
     '_normalize_address',
+    '_normalize_address_with_status',
     '_clean_name',
     'extract_invoice_ship_to',
 ]
