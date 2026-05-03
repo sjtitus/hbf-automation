@@ -20,13 +20,13 @@ like federal complexes); a single Customer can have many addresses
 invariant is `(Name, normalized shipto_name, NormalizedAddress)`.
 
 **Validation phase** runs at load time. Hard-rule violations
-(missing required fields, duplicate triples, missing customer number)
-are reported and — when `strict=True` — abort the load via
-`MasterValidationError`. Soft-rule warnings (duplicate customer
-number, malformed-but-recovered customer number, AL1 strict-parse
-failure, no-dash AL1) are reported but never abort. A human-readable
-validation log file is written to
-`<log_dir>/customer_master_validation.log` when `log_dir` is provided.
+(missing required fields, duplicate triples, could-not-extract
+customer number) are reported and — when `strict=True` — abort the
+load via `MasterValidationError`. Soft-rule warnings (duplicate
+customer number, malformed-but-recovered customer number) are
+reported but never abort. A human-readable validation log file is
+written to `<log_dir>/customer_master_validation.log` when `log_dir`
+is provided.
 
 NOTE (stage 1): the matching logic below predates the 5-field address
 shape; `line_2` is captured but ignored at match time. Stage-2 makes it
@@ -154,11 +154,10 @@ def parse_al1(al1) -> tuple[str, Optional[str], Optional[str], bool, bool]:
     - dash row with the separator pattern that doesn't strict-parse but
       whose post-separator text contains a 6-digit number →
       `(name_before_sep, six_digit, None, False, True)`. Recovered.
-      Validation flags via `malformed_customer_number_format`.
+      Validation flags via `malformed_customer_number_format` (soft).
     - dash row with the separator pattern that neither strict-parses
       nor yields a 6-digit fallback → `(al1.strip(), None, None, False, False)`.
-      Validation flags via both `al1_strict_parse` (soft) and
-      `missing_customer_number` (hard).
+      Validation flags via `could_not_extract_customer_number` (hard).
     - empty / None input → `('', None, None, True, False)`.
     """
     if al1 is None:
@@ -215,18 +214,16 @@ class ValidationViolation:
 
 # Rule identifiers — kept as constants so the report has a stable
 # vocabulary and tests can refer to them.
-RULE_REQUIRED_FIELDS           = 'required_fields_present'         # hard
-RULE_TRIPLE_UNIQUE             = 'triple_unique'                   # hard
-RULE_MISSING_CUSTOMER_NUMBER   = 'missing_customer_number'         # hard
-RULE_DUPLICATE_CUSTOMER_NUMBER = 'duplicate_customer_number'       # soft
+RULE_REQUIRED_FIELDS           = 'required_fields_present'           # hard
+RULE_TRIPLE_UNIQUE             = 'triple_unique'                     # hard
+RULE_NO_CUSTOMER_NUMBER        = 'could_not_extract_customer_number' # hard
+RULE_DUPLICATE_CUSTOMER_NUMBER = 'duplicate_customer_number'         # soft
 RULE_MALFORMED_CUSTOMER_NUMBER = 'malformed_customer_number_format'  # soft
-RULE_AL1_STRICT_PARSE          = 'al1_strict_parse'                # soft
-RULE_NO_DASH_AL1               = 'no_dash_al1'                     # soft
 
 _HARD_RULES = {
     RULE_REQUIRED_FIELDS,
     RULE_TRIPLE_UNIQUE,
-    RULE_MISSING_CUSTOMER_NUMBER,
+    RULE_NO_CUSTOMER_NUMBER,
 }
 
 
@@ -238,7 +235,6 @@ class _RowRecord:
     shipto_name: str                      # parsed AL1 shipping name
     customer_number: Optional[str]
     al1_extra: Optional[str]
-    al1_parsed_ok: bool                   # AL1 strict-parse status
     al1_recovered_via_fallback: bool      # number recovered via loose 6-digit scan
     address: Optional[NormalizedAddress]  # None if CSZ missing
 
@@ -251,11 +247,9 @@ def validate_master(records: list[_RowRecord]) -> list[ValidationViolation]:
     violations: list[ValidationViolation] = []
     violations.extend(_check_required_fields(records))
     violations.extend(_check_triple_unique(records))
-    violations.extend(_check_missing_customer_number(records))
+    violations.extend(_check_could_not_extract_customer_number(records))
     violations.extend(_check_duplicate_customer_number(records))
     violations.extend(_check_malformed_customer_number_format(records))
-    violations.extend(_check_al1_strict_parse(records))
-    violations.extend(_check_no_dash_al1(records))
     violations.sort(key=lambda v: (v.row, v.rule))
     return violations
 
@@ -310,28 +304,29 @@ def _check_triple_unique(records: list[_RowRecord]) -> list[ValidationViolation]
     return out
 
 
-def _check_missing_customer_number(records: list[_RowRecord]) -> list[ValidationViolation]:
-    """Hard rule: every row MUST have a parseable HBF customer number.
+def _check_could_not_extract_customer_number(records: list[_RowRecord]) -> list[ValidationViolation]:
+    """Hard rule: every row MUST yield an extractable HBF customer
+    number — either via strict parse of the canonical
+    `<name> - <number>[, extra]` shape, or via the loose 6-digit
+    fallback when the format is malformed.
 
-    The customer number is the canonical HBF customer ID — ridiculously
-    encoded inside AL1 rather than its own column, but it's the
-    identifier that matters for billing. A row without one is a real
-    data integrity gap that should be fixed in the spreadsheet.
-
-    This rule is more operationally meaningful than its two soft
-    cousins (`al1_strict_parse`, `no_dash_al1`), which describe HOW
-    the AL1 fails to yield a number. This rule says THAT the row has
-    no usable HBF customer ID.
+    Fires whenever neither path yielded a number. The two underlying
+    causes are (a) AL1 has no customer-number separator at all (e.g.
+    'Star Foods'), and (b) AL1 has a separator but the format is
+    broken AND no 6-digit number is recoverable from the post-separator
+    text (e.g. 'Dairyfood - C', 'GES - ... Booth #1465...'). The AL1
+    is dumped in the message so the human reader can see which
+    sub-case applies and fix accordingly. The rule label uses
+    "could not extract" rather than "no separator" because the cause
+    isn't always missing-separator.
     """
     out = []
     for r in records:
         if r.customer_number is None:
             al1 = r.raw.get('AddressLine1')
             out.append(ValidationViolation(
-                row=r.row, rule=RULE_MISSING_CUSTOMER_NUMBER, severity='hard',
-                message=(
-                    f"row has no parseable HBF customer number (AL1={al1!r})"
-                ),
+                row=r.row, rule=RULE_NO_CUSTOMER_NUMBER, severity='hard',
+                message=f"could not extract customer number from AL1: {al1!r}",
                 raw=r.raw,
             ))
     return out
@@ -390,56 +385,6 @@ def _check_malformed_customer_number_format(records: list[_RowRecord]) -> list[V
     return out
 
 
-def _check_al1_strict_parse(records: list[_RowRecord]) -> list[ValidationViolation]:
-    """Soft rule: AL1 that uses the customer-number separator pattern
-    (whitespace-dash) should strict-parse to a clean
-    `<name> - <digits>[<sep><extra>]`. Flags rows that LOOK like
-    they're trying to have a customer number but the format is wrong
-    (Lompoc-style missing dash before number, `#`-prefix on number,
-    orphan `- C` suffix, etc.). Rows with no customer-number separator
-    pattern (only internal hyphens or no dash at all) are flagged by
-    the no-customer-number rule instead, not here.
-    """
-    out = []
-    for r in records:
-        al1 = r.raw.get('AddressLine1')
-        if al1 is None:
-            continue
-        s = str(al1)
-        if not _CUSTOMER_NUM_SEP_RE.search(s):
-            continue  # no separator pattern → not this rule's concern
-        if not r.al1_parsed_ok:
-            out.append(ValidationViolation(
-                row=r.row, rule=RULE_AL1_STRICT_PARSE, severity='soft',
-                message=(f"AL1 has a customer-number separator but "
-                         f"doesn't match expected format: {al1!r}"),
-                raw=r.raw,
-            ))
-    return out
-
-
-def _check_no_dash_al1(records: list[_RowRecord]) -> list[ValidationViolation]:
-    """Soft rule: AL1 with no customer-number separator pattern (no
-    `\\s+-\\s` anywhere). Includes both true no-dash rows and rows
-    whose only dashes are internal hyphens within words (e.g.,
-    'ABF Freight c/o PeakXpo GSNA-Jekyll Island'). Flags the row for
-    human review; legitimate no-customer-number rows are fine to
-    ignore.
-    """
-    out = []
-    for r in records:
-        al1 = r.raw.get('AddressLine1')
-        if al1 is None:
-            continue
-        if not _CUSTOMER_NUM_SEP_RE.search(str(al1)):
-            out.append(ValidationViolation(
-                row=r.row, rule=RULE_NO_DASH_AL1, severity='soft',
-                message=f"AL1 has no customer number assigned: {al1!r}",
-                raw=r.raw,
-            ))
-    return out
-
-
 def write_validation_report(
     violations: list[ValidationViolation],
     *,
@@ -484,11 +429,9 @@ def write_validation_report(
     rule_specs = [
         (RULE_REQUIRED_FIELDS,           'hard', 'Required fields non-empty'),
         (RULE_TRIPLE_UNIQUE,             'hard', 'Triple uniqueness (Name, shipto_name, address)'),
-        (RULE_MISSING_CUSTOMER_NUMBER,   'hard', 'Every row has an HBF customer number'),
+        (RULE_NO_CUSTOMER_NUMBER,        'hard', 'Could not extract customer number'),
         (RULE_DUPLICATE_CUSTOMER_NUMBER, 'soft', 'Customer numbers are unique'),
         (RULE_MALFORMED_CUSTOMER_NUMBER, 'soft', 'Customer number recovered from malformed AL1 format'),
-        (RULE_AL1_STRICT_PARSE,          'soft', 'AL1 strict-parse failure'),
-        (RULE_NO_DASH_AL1,               'soft', 'AL1 has no customer number assigned'),
     ]
 
     lines.append("=== HARD RULES ===")
@@ -551,7 +494,7 @@ def _read_rows(path: Path) -> list[_RowRecord]:
                 'City': city, 'State': state, 'Postcode': pc,
             }
 
-            shipto_name, cust_num, al1_extra, al1_ok, al1_recovered = parse_al1(al1)
+            shipto_name, cust_num, al1_extra, _al1_ok, al1_recovered = parse_al1(al1)
 
             # Build address only when CSZ is present (else it's a
             # required-fields violation and address can't be keyed).
@@ -566,7 +509,7 @@ def _read_rows(path: Path) -> list[_RowRecord]:
             records.append(_RowRecord(
                 row=row_idx, raw=raw,
                 shipto_name=shipto_name, customer_number=cust_num,
-                al1_extra=al1_extra, al1_parsed_ok=al1_ok,
+                al1_extra=al1_extra,
                 al1_recovered_via_fallback=al1_recovered,
                 address=addr,
             ))

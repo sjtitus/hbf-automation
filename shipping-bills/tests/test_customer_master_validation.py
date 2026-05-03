@@ -23,11 +23,9 @@ from hbf_shipping.customer_address_map import (
     MasterValidationError,
     RULE_REQUIRED_FIELDS,
     RULE_TRIPLE_UNIQUE,
-    RULE_MISSING_CUSTOMER_NUMBER,
+    RULE_NO_CUSTOMER_NUMBER,
     RULE_DUPLICATE_CUSTOMER_NUMBER,
     RULE_MALFORMED_CUSTOMER_NUMBER,
-    RULE_AL1_STRICT_PARSE,
-    RULE_NO_DASH_AL1,
     validate_master,
     _RowRecord,
 )
@@ -82,7 +80,7 @@ from hbf_shipping.customer_address_map import (
     ("Victorville USP - #204512, ATTN: Warehouse/Commissary (USP)",
      ("Victorville USP", "204512", None, False, True)),
     # Strict-fail with NO 6-digit anywhere after the separator → not
-    # recovered. Validation will fire al1_strict_parse + missing_customer_number.
+    # recovered. Validation fires could_not_extract_customer_number (hard).
     ("Foo - bar baz",
      ("Foo - bar baz", None, None, False, False)),
     # Internal-hyphen ONLY (no whitespace around dash) → no customer-number
@@ -199,23 +197,6 @@ def test_triple_unique_violation(synthetic_master_path, tmp_path):
     assert 'first seen at row 2' in log
 
 
-def test_al1_strict_parse_violations(synthetic_master_path, tmp_path):
-    load_address_to_customers(synthetic_master_path, log_dir=tmp_path)
-    log = (tmp_path / 'customer_master_validation.log').read_text()
-    # row 6 (Lompoc missing-dash) and row 7 (Victorville `#`-prefix)
-    assert RULE_AL1_STRICT_PARSE in log
-    assert 'row   6' in log
-    assert 'row   7' in log
-
-
-def test_no_dash_al1_violation(synthetic_master_path, tmp_path):
-    load_address_to_customers(synthetic_master_path, log_dir=tmp_path)
-    log = (tmp_path / 'customer_master_validation.log').read_text()
-    # row 8 (Freshlunches) has no dash
-    assert RULE_NO_DASH_AL1 in log
-    assert 'row   8' in log
-
-
 def test_strict_mode_raises(synthetic_master_path, tmp_path):
     """strict=True aborts with MasterValidationError; report still written."""
     with pytest.raises(MasterValidationError):
@@ -265,17 +246,17 @@ def test_validation_report_summary_counts(synthetic_master_path, tmp_path):
     # Hard violations on the fixture:
     #   row 4: triple_unique (duplicate of row 2)
     #   row 5: required_fields_present (Star Foods CSZ blank)
-    #   row 5: missing_customer_number (Star Foods AL1 no dash)
-    #   row 8: missing_customer_number (Freshlunches no dash)
-    # Rows 6 (Lompoc) and 7 (Victorville) NO LONGER fire
-    # missing_customer_number — the loose 6-digit fallback recovers
-    # their customer numbers; they're flagged soft via
+    #   row 5: could_not_extract_customer_number (Star Foods, no separator)
+    #   row 8: could_not_extract_customer_number (Freshlunches, no separator)
+    # Rows 6 (Lompoc) and 7 (Victorville) DO NOT fire
+    # could_not_extract_customer_number — the loose 6-digit fallback
+    # recovers their customer numbers; they appear under soft
     # malformed_customer_number_format instead.
     # Total hard = 4.
     assert 'Hard violations: 4' in log
-    # Soft warnings include: malformed-format (rows 6, 7), AL1
-    # strict-parse fail (rows 6, 7), no-dash AL1 (rows 5, 8). Don't pin
-    # exact count — just sanity-check the section appears.
+    # Soft warnings on the fixture: malformed_customer_number_format
+    # (rows 6, 7). No standalone "no separator" or "strict-parse"
+    # entries — those collapsed into the could-not-extract hard rule.
     assert 'Soft warnings:' in log
 
 
@@ -300,41 +281,14 @@ def test_log_dir_none_skips_log_writing(synthetic_master_path):
     assert isinstance(result, dict)
 
 
-def test_internal_hyphen_only_is_no_customer_number_not_strict_fail(tmp_path):
-    """A row whose only dash is internal to a word (e.g. 'GSNA-Jekyll')
-    has no customer-number separator pattern and must be flagged by
-    `no_dash_al1` (no customer number), NOT by `al1_strict_parse`
-    (which is for malformed customer-number attempts).
-    """
-    rows = [
-        # Internal hyphen only — no separator. Mirrors ABF Freight row 171.
-        {'Name': 'ABF Freight', 'AddressLine1': 'ABF Freight c/o PeakXpo GSNA-Jekyll Island',
-         'AddressLine2': '100 Main St', 'City': 'Jekyll Island', 'State': 'GA',
-         'Postcode': '31527'},
-    ]
-    path = _make_master(tmp_path, rows)
-    load_address_to_customers(path, log_dir=tmp_path)
-    log = (tmp_path / 'customer_master_validation.log').read_text()
-    # Should be flagged as no_dash_al1 (no customer number)
-    assert 'rule=no_dash_al1' in log
-    assert 'row   2' in log
-    # Should NOT be flagged as al1_strict_parse (it's not a malformed
-    # customer-number attempt)
-    assert '[WARN] AL1 strict-parse failure' not in log
-    # The OK section header for that rule SHOULD be present (zero violations)
-    assert '[OK] AL1 strict-parse failure' in log
-
-
 # ============================================================
-# New customer-number rules
+# Customer-number rules
 # ============================================================
 
 
-def test_missing_customer_number_fires_for_no_dash_row(tmp_path):
-    """Hard rule: every row needs a parseable HBF customer number.
-    A no-dash row gets parsed as `customer_number=None` and fires
-    RULE_MISSING_CUSTOMER_NUMBER (in addition to the soft no_dash_al1
-    rule)."""
+def test_no_customer_number_fires_for_no_separator(tmp_path):
+    """No-separator AL1 ('Star Foods'-style) → no customer number can
+    be extracted → could_not_extract_customer_number (hard)."""
     rows = [
         {'Name': 'Freshlunches', 'AddressLine1': 'Freshlunches',
          'AddressLine2': '100 Main St', 'City': 'Austin',
@@ -343,17 +297,35 @@ def test_missing_customer_number_fires_for_no_dash_row(tmp_path):
     path = _make_master(tmp_path, rows)
     load_address_to_customers(path, log_dir=tmp_path)
     log = (tmp_path / 'customer_master_validation.log').read_text()
-    assert 'rule=missing_customer_number' in log
+    assert 'rule=could_not_extract_customer_number' in log
     assert 'row   2' in log
-    assert 'no parseable HBF customer number' in log
+    assert 'could not extract customer number from AL1:' in log
+
+
+def test_no_customer_number_fires_for_unrecoverable_row(tmp_path):
+    """Separator present, strict parse fails, no 6-digit recoverable —
+    'Dairyfood - C' style. Falls through to could_not_extract_customer_number
+    (hard); the AL1 surfaces in the message so HBF can see the cause."""
+    rows = [
+        {'Name': 'Dairyfood', 'AddressLine1': 'Dairyfood - C',
+         'AddressLine2': '100 Main St', 'City': 'Austin',
+         'State': 'TX', 'Postcode': '78701'},
+    ]
+    path = _make_master(tmp_path, rows)
+    load_address_to_customers(path, log_dir=tmp_path)
+    log = (tmp_path / 'customer_master_validation.log').read_text()
+    assert 'rule=could_not_extract_customer_number' in log
+    assert "'Dairyfood - C'" in log
+    # Did NOT recover, so malformed-format must NOT fire for this row.
+    assert '[OK] Customer number recovered from malformed AL1 format' in log
 
 
 def test_malformed_customer_number_format_recovers_lompoc_style(tmp_path):
     """A Lompoc-style row ('Camp 208015' missing the dash before the
     number) fails strict parse but the 6-digit fallback recovers the
-    customer number. Fires `malformed_customer_number_format` (soft)
-    and `al1_strict_parse` (soft); does NOT fire
-    `missing_customer_number` (hard) — the number is usable."""
+    customer number. Fires `malformed_customer_number_format` (soft);
+    does NOT fire `could_not_extract_customer_number` (hard) — the
+    number IS extractable, just via the fallback path."""
     rows = [
         {'Name': 'Lompoc FCC', 'AddressLine1': 'Lompoc FCC - Camp 208015',
          'AddressLine2': '3705 W Klein Blvd', 'City': 'Lompoc',
@@ -363,10 +335,8 @@ def test_malformed_customer_number_format_recovers_lompoc_style(tmp_path):
     load_address_to_customers(path, log_dir=tmp_path)
     log = (tmp_path / 'customer_master_validation.log').read_text()
     assert 'rule=malformed_customer_number_format' in log
-    assert 'rule=al1_strict_parse' in log
-    # Customer number was recovered, so the missing-number rule must NOT fire.
-    assert '[FAIL] Every row has an HBF customer number' not in log
-    assert '[OK] Every row has an HBF customer number' in log
+    # Number was recovered → could-not-extract must NOT fire.
+    assert '[OK] Could not extract customer number' in log
     # Recovered number surfaced in the message
     assert '208015' in log
 
@@ -403,30 +373,9 @@ def test_malformed_format_does_not_fire_for_clean_row(tmp_path):
     assert '[OK] Customer number recovered from malformed AL1 format' in log
 
 
-def test_strict_parse_fails_with_no_recoverable_number_still_hard(tmp_path):
-    """When a separator is present, strict parse fails, AND there's
-    no 6-digit number anywhere in the post-separator text, the row
-    falls through to `missing_customer_number` (hard) — fallback
-    couldn't rescue it."""
-    rows = [
-        # 'Dairyfood - C': separator present but only a single letter
-        # follows; no 6-digit fallback available.
-        {'Name': 'Dairyfood', 'AddressLine1': 'Dairyfood - C',
-         'AddressLine2': '100 Main St', 'City': 'Austin',
-         'State': 'TX', 'Postcode': '78701'},
-    ]
-    path = _make_master(tmp_path, rows)
-    load_address_to_customers(path, log_dir=tmp_path)
-    log = (tmp_path / 'customer_master_validation.log').read_text()
-    assert 'rule=missing_customer_number' in log
-    assert 'rule=al1_strict_parse' in log
-    # Did NOT recover, so malformed-format must NOT fire for this row.
-    assert '[OK] Customer number recovered from malformed AL1 format' in log
-
-
-def test_missing_customer_number_does_not_fire_for_clean_row(tmp_path):
+def test_no_customer_number_does_not_fire_for_clean_row(tmp_path):
     """Sanity check: a row with a clean parseable customer number
-    does NOT trigger RULE_MISSING_CUSTOMER_NUMBER."""
+    does NOT trigger could_not_extract_customer_number."""
     rows = [
         {'Name': 'Allenwood FCI',
          'AddressLine1': 'Allenwood FCI - 203437, ATTN: Commissary',
@@ -438,7 +387,7 @@ def test_missing_customer_number_does_not_fire_for_clean_row(tmp_path):
     log = (tmp_path / 'customer_master_validation.log').read_text()
     # The OK header line for the rule should be present; no violation
     # entries.
-    assert '[OK] Every row has an HBF customer number' in log
+    assert '[OK] Could not extract customer number' in log
 
 
 def test_duplicate_customer_number_fires_when_two_rows_share(tmp_path):
@@ -501,11 +450,11 @@ def test_duplicate_customer_number_does_not_fire_for_unique_numbers(tmp_path):
     assert '[OK] Customer numbers are unique' in log
 
 
-def test_missing_customer_number_is_hard(tmp_path):
-    """Missing-customer-number is hard — strict mode aborts when a
-    row has no recoverable customer number at all."""
+def test_no_customer_number_is_hard(tmp_path):
+    """could_not_extract_customer_number is hard — strict mode aborts
+    when a row has no extractable customer number."""
     rows = [
-        {'Name': 'Missing Number', 'AddressLine1': 'Missing Number',
+        {'Name': 'No Number', 'AddressLine1': 'No Number',
          'AddressLine2': '100 Main St', 'City': 'Austin',
          'State': 'TX', 'Postcode': '78701'},
     ]
