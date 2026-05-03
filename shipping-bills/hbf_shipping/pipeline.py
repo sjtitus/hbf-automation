@@ -1,12 +1,20 @@
 """
-Vendor-agnostic invoice ShipTo extraction pipeline (stage 1).
+Vendor-agnostic invoice processing pipeline (stage 2).
 
 Per invoice:
-    parse PDF → page-1 InvoiceExtraction → page-2 BolExtraction → log summary
+    parse PDF
+        → page-1 InvoiceExtraction (ShipTo)
+        → page-2 BolExtraction     (ShipTo)
+        → customer match against the customer master
+        → log outcome
 
-Stage 1 stops here: no customer lookup, no BillEntry construction, no CSV.
-The next stage will rebuild matching/CSV against the new canonical ShipTo
-shape produced here.
+The customer-master validation runs once at startup; with
+`strict_master=True`, hard violations abort. The validation report is
+written to `<run_dir>/customer_master_validation.log`.
+
+Per-invoice non-trivial match details (multi-row 4-tuple matches,
+BOL-vs-page-1 disagreements, hard fails) go to the per-invoice log
+at `<run_dir>/<invoice-stem>.log`.
 
 The vendor module must provide:
     parse_invoice(pdf_path) -> (invoice_data: dict, reasons: dict)
@@ -17,15 +25,43 @@ The vendor module must provide:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from .bol_ship_to import extract_ship_to
-from .customer_address_map import load_address_to_customers
+from .customer_address_map import (
+    InvoiceMatchResult,
+    MatchMethod,
+    format_match_log,
+    load_master,
+    match_invoice_customer,
+)
 from .run_logging import invoice_logger
 
 
 logger = logging.getLogger(__name__)
+
+
+# Match methods that constitute "non-trivial" cases worth logging in
+# detail (multi-row name disambig used; cross-source disagreement;
+# match denied; hard fail). Trivial cases (agree/bol_only/inv_only with
+# UNIQUE on the resolving side) get a one-line note only.
+_NONTRIVIAL_METHODS = frozenset({
+    MatchMethod.BOL_WINS_DISAGREEMENT,
+    MatchMethod.HARD_FAIL,
+    MatchMethod.DENIED,
+})
+
+
+@dataclass(frozen=True)
+class InvoiceOutcome:
+    """One row of the batch summary."""
+    pdf_path: Path
+    inv: object                  # InvoiceExtraction or None
+    bol: object                  # BolExtraction or None
+    match: Optional[InvoiceMatchResult]
 
 
 def _fmt_addr(addr) -> str:
@@ -42,47 +78,12 @@ def _fmt_addr(addr) -> str:
     return '  '.join(parts)
 
 
-def _agree_addr(a, b) -> str:
-    """Compare two NormalizedAddresses for downstream-matching purposes.
-    Currently strict equality on all 5 fields; reports which fields
-    differ on a mismatch. Both-None returns 'both missing'.
-    """
-    if a is None and b is None:
-        return 'both missing'
-    if a is None:
-        return 'page-1 missing'
-    if b is None:
-        return 'BOL missing'
-    if a == b:
-        return 'EXACT'
-    diffs = []
-    for f in ('street', 'line_2', 'city', 'state', 'postcode'):
-        if getattr(a, f) != getattr(b, f):
-            diffs.append(f"{f}: {getattr(a, f)!r} != {getattr(b, f)!r}")
-    return 'DIFFER (' + '; '.join(diffs) + ')'
-
-
-def _agree_name(a: str | None, b: str | None) -> str:
-    if not a and not b:
-        return 'both missing'
-    if not a:
-        return 'page-1 missing'
-    if not b:
-        return 'BOL missing'
-    if a == b:
-        return 'EXACT'
-    if a.lower().strip() == b.lower().strip():
-        return 'case-insensitive match'
-    return f'DIFFER ({a!r} vs {b!r})'
-
-
 class Pipeline:
-    """Stage 1: parse + extract ShipTo (page-1 and BOL) + log summary.
+    """Stage 2 pipeline: extract ShipTos, match each invoice to a customer.
 
-    Also runs customer-master validation at startup. With
-    `strict_master=True`, any hard-rule violation aborts via
-    `MasterValidationError`. The validation report is always written to
-    `<run_dir>/customer_master_validation.log`.
+    Customer-master is loaded + validated at startup. Per-invoice work
+    runs page-1 + BOL extraction, then `match_invoice_customer` to
+    resolve the customer.
     """
 
     def __init__(self, vendor, run_id: str, run_dir: Path,
@@ -91,20 +92,19 @@ class Pipeline:
         self.run_id = run_id
         self.run_dir = run_dir
         self.diagnostic_dir = run_dir / 'shipto_diagnostics'
-        self.results: list[tuple[Path, object, object]] = []
+        self.outcomes: list[InvoiceOutcome] = []
         self.batch_started: str | None = None
         self.batch_ended: str | None = None
 
         # Load + validate the customer master at startup. Validation log
         # lands in run_dir; strict mode propagates via MasterValidationError.
-        self.address_map = load_address_to_customers(
-            strict=strict_master, log_dir=run_dir,
-        )
+        self.master = load_master(strict=strict_master, log_dir=run_dir)
 
     def process_invoice(self, pdf_path) -> bool:
-        """Run page-1 + BOL ShipTo extraction on one PDF. Logs a summary
-        block. Returns True if both extractions produced a usable ShipTo
-        (success=True), False otherwise.
+        """Run extraction + customer matching on one PDF.
+
+        Returns True on a successful match (`match.customer_name` is
+        not None and method is not HARD_FAIL/DENIED).
         """
         pdf_path = Path(pdf_path)
 
@@ -117,7 +117,7 @@ class Pipeline:
                 invoice_data, _reasons = self.vendor.parse_invoice(str(pdf_path))
             except Exception as e:
                 logger.error(f"parse_invoice raised: {e}", exc_info=True)
-                self.results.append((pdf_path, None, None))
+                self.outcomes.append(InvoiceOutcome(pdf_path, None, None, None))
                 return False
 
             inv = None
@@ -132,12 +132,17 @@ class Pipeline:
             except Exception as e:
                 logger.error(f"extract_ship_to (BOL) raised: {e}", exc_info=True)
 
-            self.results.append((pdf_path, inv, bol))
-            self._log_per_invoice_summary(pdf_path, inv, bol)
+            self._log_extraction_summary(inv, bol)
 
-            return bool(inv and inv.success and bol and bol.success)
+            # Run the matcher.
+            match = match_invoice_customer(inv, bol, self.master)
+            self._log_match_outcome(match)
 
-    def _log_per_invoice_summary(self, pdf_path: Path, inv, bol):
+            self.outcomes.append(InvoiceOutcome(pdf_path, inv, bol, match))
+            return match.customer_name is not None
+
+    def _log_extraction_summary(self, inv, bol):
+        """One-screen summary of what came out of the two extractors."""
         logger.info("\n--- PAGE-1 (Invoice) ---")
         if inv is None:
             logger.info("  <extractor raised; see traceback above>")
@@ -163,10 +168,34 @@ class Pipeline:
                 logger.info(f"  diagnostic_png:  {bol.diagnostic_path}")
             logger.info(f"  raw_lines:       {bol.raw_lines}")
 
-        if inv is not None and bol is not None:
-            logger.info("\n--- AGREE ---")
-            logger.info(f"  address: {_agree_addr(inv.ship_to.address, bol.ship_to.address)}")
-            logger.info(f"  name:    {_agree_name(inv.ship_to.name, bol.ship_to.name)}")
+    def _log_match_outcome(self, match: InvoiceMatchResult):
+        """Always log the one-line match result. Log full details for
+        non-trivial cases (disagreements, hard fails, denied)."""
+        logger.info("\n--- CUSTOMER MATCH ---")
+
+        # One-line headline.
+        cn_repr = match.customer_name if match.customer_name else '<none>'
+        logger.info(
+            f"  result: customer={cn_repr!r}  method={match.method}  "
+            f"severity={match.severity}"
+        )
+        if match.fail_reason:
+            logger.info(f"  fail_reason: {match.fail_reason}")
+
+        # Detail dump for non-trivial cases — this is the per-invoice
+        # log paying its keep. The detail block is written through
+        # `format_match_log` which renders the full per-source state
+        # plus the name-disambig matrix.
+        nontrivial = (
+            match.method in _NONTRIVIAL_METHODS
+            or match.bol.method == MatchMethod.DISAMBIGUATED
+            or match.inv.method == MatchMethod.DISAMBIGUATED
+            or match.bol.method == MatchMethod.AMBIGUOUS
+            or match.inv.method == MatchMethod.AMBIGUOUS
+        )
+        if nontrivial:
+            for line in format_match_log(match).splitlines():
+                logger.info(f"  {line}")
 
     def process_batch(self, folder_path) -> dict:
         folder = Path(folder_path)
@@ -201,49 +230,50 @@ class Pipeline:
 
     def report(self) -> None:
         """Print a final cross-invoice summary table to the run log / stdout."""
-        if not self.results:
+        if not self.outcomes:
             return
 
-        logger.info(f"\n{'='*78}")
-        logger.info("STAGE-1 SHIP TO EXTRACTION — BATCH SUMMARY")
-        logger.info(f"{'='*78}")
+        logger.info(f"\n{'='*100}")
+        logger.info("STAGE-2 INVOICE PROCESSING — BATCH SUMMARY")
+        logger.info(f"{'='*100}")
 
-        header = f"{'Invoice':<32}  {'PG1':<4}  {'BOL':<4}  {'Addr Agree':<8}  {'Name Agree':<8}"
+        header = (
+            f"{'Invoice':<34}  {'PG1':<4}  {'BOL':<4}  "
+            f"{'Match Method':<24}  {'Sev':<6}  Customer"
+        )
         logger.info(header)
         logger.info('-' * len(header))
 
-        n_inv_ok = n_bol_ok = n_addr_agree = n_name_agree = 0
-        for pdf_path, inv, bol in self.results:
-            inv_ok = bool(inv and inv.success)
-            bol_ok = bool(bol and bol.success)
-            n_inv_ok += int(inv_ok)
+        n = len(self.outcomes)
+        n_pg1_ok = n_bol_ok = n_resolved = n_severe = 0
+        for o in self.outcomes:
+            pg1_ok = bool(o.inv and o.inv.success)
+            bol_ok = bool(o.bol and o.bol.success)
+            n_pg1_ok += int(pg1_ok)
             n_bol_ok += int(bol_ok)
 
-            inv_addr = inv.ship_to.address if inv else None
-            bol_addr = bol.ship_to.address if bol else None
-            inv_name = inv.ship_to.name if inv else None
-            bol_name = bol.ship_to.name if bol else None
-
-            addr_agree = (inv_addr is not None and bol_addr is not None
-                          and inv_addr == bol_addr)
-            name_agree = bool(inv_name and bol_name
-                              and inv_name.lower().strip()
-                              == bol_name.lower().strip())
-            n_addr_agree += int(addr_agree)
-            n_name_agree += int(name_agree)
+            method = o.match.method if o.match else '<no-match-run>'
+            severity = o.match.severity if o.match else '-'
+            customer = o.match.customer_name if o.match and o.match.customer_name else '-'
+            if o.match and o.match.customer_name is not None:
+                n_resolved += 1
+            if o.match and o.match.severity == 'severe':
+                n_severe += 1
 
             logger.info(
-                f"{pdf_path.name:<32}  "
-                f"{'OK' if inv_ok else 'FAIL':<4}  "
+                f"{o.pdf_path.name:<34}  "
+                f"{'OK' if pg1_ok else 'FAIL':<4}  "
                 f"{'OK' if bol_ok else 'FAIL':<4}  "
-                f"{'YES' if addr_agree else 'no':<8}  "
-                f"{'YES' if name_agree else 'no':<8}"
+                f"{method:<24}  "
+                f"{severity:<6}  "
+                f"{customer}"
             )
 
-        n = len(self.results)
         logger.info('-' * len(header))
-        logger.info(f"Totals: {n} invoices  |  page-1 OK: {n_inv_ok}/{n}  |  "
-                    f"BOL OK: {n_bol_ok}/{n}  |  addr agree: {n_addr_agree}/{n}  |  "
-                    f"name agree: {n_name_agree}/{n}")
+        logger.info(
+            f"Totals: {n} invoices  |  page-1 OK: {n_pg1_ok}/{n}  |  "
+            f"BOL OK: {n_bol_ok}/{n}  |  resolved: {n_resolved}/{n}  |  "
+            f"severe: {n_severe}/{n}"
+        )
         logger.info(f"BOL diagnostic PNGs: {self.diagnostic_dir}/")
-        logger.info(f"{'='*78}\n")
+        logger.info(f"{'='*100}\n")

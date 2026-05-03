@@ -428,29 +428,9 @@ def write_validation_report(
 # ============================================================
 
 
-def load_address_to_customers(
-    xlsx_path: Union[str, Path, None] = None,
-    *,
-    strict: bool = False,
-    log_dir: Union[str, Path, None] = None,
-) -> dict:
-    """Load the customer-address XLSX and return
-    `dict[NormalizedAddress, list[CustomerEntry]]`.
-
-    Validation runs at load time. When `log_dir` is provided, a
-    human-readable report is written to
-    `<log_dir>/customer_master_validation.log`. When `strict=True`, any
-    hard-rule violation aborts the load via `MasterValidationError`
-    (the report is still written first so the human can see what
-    failed).
-
-    Rows with hard `required_fields_present` violations are excluded
-    from the returned dict — they're not usable for matching anyway.
-    All other rows are included.
-    """
-    path = Path(xlsx_path) if xlsx_path else DEFAULT_ADDRESS_FILE
-    log_dir_path = Path(log_dir) if log_dir is not None else None
-
+def _read_rows(path: Path) -> list[_RowRecord]:
+    """Read the XLSX and return one `_RowRecord` per non-empty data row.
+    Performs AL1 parse and address normalization. No validation here."""
     wb = load_workbook(filename=str(path), data_only=True, read_only=True)
     try:
         ws = wb.active
@@ -491,7 +471,19 @@ def load_address_to_customers(
             ))
     finally:
         wb.close()
+    return records
 
+
+def _validate_and_report(
+    records: list[_RowRecord],
+    *,
+    source_path: Path,
+    strict: bool,
+    log_dir_path: Optional[Path],
+) -> list[_RowRecord]:
+    """Run validation, write the report (if log_dir given), raise on
+    strict-mode hard violations. Returns the records that pass the
+    required-fields rule (suitable for downstream indexing)."""
     violations = validate_master(records)
     n_hard = sum(1 for v in violations if v.severity == 'hard')
     n_soft = sum(1 for v in violations if v.severity == 'soft')
@@ -502,7 +494,7 @@ def load_address_to_customers(
         log_path = log_dir_path / 'customer_master_validation.log'
         write_validation_report(
             violations,
-            source_path=path,
+            source_path=source_path,
             total_rows=len(records),
             log_path=log_path,
             strict=strict,
@@ -520,17 +512,38 @@ def load_address_to_customers(
             f"see {log_dir_path / 'customer_master_validation.log' if log_dir_path else '<log not written>'}"
         )
 
-    # Build the result, excluding rows with required-fields violations.
     rows_with_required_violation: set[int] = {
         v.row for v in violations if v.rule == RULE_REQUIRED_FIELDS
     }
+    return [
+        r for r in records
+        if r.row not in rows_with_required_violation and r.address is not None
+    ]
+
+
+def load_address_to_customers(
+    xlsx_path: Union[str, Path, None] = None,
+    *,
+    strict: bool = False,
+    log_dir: Union[str, Path, None] = None,
+) -> dict:
+    """Load the customer-address XLSX and return
+    `dict[NormalizedAddress, list[CustomerEntry]]`.
+
+    Legacy entry point. New code should prefer `load_master` which
+    returns a richer `CustomerMaster` with both address and
+    customer-name indexes.
+    """
+    path = Path(xlsx_path) if xlsx_path else DEFAULT_ADDRESS_FILE
+    log_dir_path = Path(log_dir) if log_dir is not None else None
+
+    records = _read_rows(path)
+    valid = _validate_and_report(
+        records, source_path=path, strict=strict, log_dir_path=log_dir_path,
+    )
 
     result: dict = {}
-    for r in records:
-        if r.row in rows_with_required_violation:
-            continue
-        if r.address is None:
-            continue
+    for r in valid:
         entry = CustomerEntry(
             name=str(r.raw['Name']).strip() if r.raw['Name'] is not None else '',
             shipto_name=r.shipto_name,
@@ -538,11 +551,54 @@ def load_address_to_customers(
         result.setdefault(r.address, []).append(entry)
 
     logger.info(
-        "loaded customer master: %d unique addresses from %d rows "
-        "(%d hard violations, %d soft warnings)",
-        len(result), len(records), n_hard, n_soft,
+        "loaded customer master (legacy dict): %d unique addresses from %d rows",
+        len(result), len(records),
     )
     return result
+
+
+def load_master(
+    xlsx_path: Union[str, Path, None] = None,
+    *,
+    strict: bool = False,
+    log_dir: Union[str, Path, None] = None,
+) -> 'CustomerMaster':
+    """Load the customer-master XLSX as a `CustomerMaster` instance with
+    both address and customer-name indexes.
+
+    Validation runs at load time. When `log_dir` is provided, a
+    human-readable report is written to
+    `<log_dir>/customer_master_validation.log`. When `strict=True`, any
+    hard-rule violation aborts the load via `MasterValidationError`.
+    Rows with required-fields violations are excluded.
+    """
+    path = Path(xlsx_path) if xlsx_path else DEFAULT_ADDRESS_FILE
+    log_dir_path = Path(log_dir) if log_dir is not None else None
+
+    records = _read_rows(path)
+    valid = _validate_and_report(
+        records, source_path=path, strict=strict, log_dir_path=log_dir_path,
+    )
+
+    entries = [
+        MasterEntry(
+            customer_name=str(r.raw['Name']).strip() if r.raw['Name'] is not None else '',
+            shipto_name=r.shipto_name,
+            address=r.address,
+            customer_number=r.customer_number,
+            row=r.row,
+        )
+        for r in valid
+    ]
+    master = CustomerMaster(entries)
+    logger.info(
+        "loaded customer master: %d entries / %d unique 4-tuple addresses / "
+        "%d unique customer names",
+        len(master.entries),
+        len(master.by_address_4tuple),
+        len(master.by_customer_name),
+    )
+    return master
 
 
 _LEADING_NUMBER_RE = re.compile(r'^\s*(\d+(?:-\d+)?)')
@@ -841,3 +897,350 @@ def _name_fallback_search(
 
     near_miss = by_norm.get(best_norm, []) if best_norm else []
     return near_miss, 'tried_failed', name_score
+
+
+# ============================================================
+# Stage-2 customer matching
+# ============================================================
+#
+# Vocabulary:
+#   "Customer name" = `Name` column (the billing entity, output of matching).
+#   "Ship-to name"  = parsed AL1 prefix (used internally for row narrowing,
+#                     never called the customer name).
+#   Address match key = the 4-tuple (street, city, state, postcode).
+#   line_2 is preserved on NormalizedAddress for display but is NOT in the
+#   match key.
+
+
+# Default minimum WRatio for the name-disambig matrix to accept a
+# fuzzy-name hit when a multi-row 4-tuple address match needs to be
+# narrowed. Tunable; user-confirmed starting value 75.
+NAME_DISAMBIG_THRESHOLD = 75
+
+# Customer-name deny-list. Matches against these rows are an error
+# (rows 182, 183 in the master are 'Highland Beef Farms Inventory' —
+# internal one-offs, never a real customer).
+_HBF_INVENTORY_NORM = 'highland beef farms inventory'
+
+
+@dataclass(frozen=True)
+class MasterEntry:
+    """One canonical row from the customer master.
+
+    `customer_name` is the `Name` column (THE billing entity — what
+    appears on the QuickBooks bill). `shipto_name` is the parsed AL1
+    prefix (the destination's identity, used for matching but never
+    called the customer name).
+    """
+    customer_name: str
+    shipto_name: str
+    address: NormalizedAddress
+    customer_number: Optional[str]
+    row: int                              # 1-indexed XLSX row, for diagnostics
+
+
+class CustomerMaster:
+    """The customer master with two public indexes:
+
+      - `by_address_4tuple` (street, city, state, postcode) → entries.
+        Primary for invoice matching. line_2 is NOT in the key.
+      - `by_customer_name` normalized Customer Name (Name column) →
+        entries. The public 'lookup by name' API.
+
+    The master also exposes `entries` for callers that want to scan
+    the flat list (e.g. tools).
+    """
+
+    def __init__(self, entries: list[MasterEntry]):
+        self.entries: list[MasterEntry] = list(entries)
+        self.by_address_4tuple: dict[
+            tuple[str, str, str, str], list[MasterEntry]
+        ] = {}
+        self.by_customer_name: dict[str, list[MasterEntry]] = {}
+        for e in self.entries:
+            key4 = (e.address.street, e.address.city,
+                    e.address.state, e.address.postcode)
+            self.by_address_4tuple.setdefault(key4, []).append(e)
+            cn_norm = _normalize_name(e.customer_name)
+            if cn_norm:
+                self.by_customer_name.setdefault(cn_norm, []).append(e)
+
+    def lookup_address(
+        self, addr_4tuple: tuple[str, str, str, str],
+    ) -> list[MasterEntry]:
+        """Return entries whose 4-tuple address (street, city, state,
+        postcode) exactly matches. Empty list on miss."""
+        return list(self.by_address_4tuple.get(tuple(addr_4tuple), []))
+
+    def lookup_customer_name(self, name: str) -> list[MasterEntry]:
+        """Return entries whose Customer Name (`Name` column) normalizes
+        to the same form as `name`. The public by-name lookup. Empty
+        list on miss."""
+        return list(self.by_customer_name.get(_normalize_name(name), []))
+
+
+# ---- Match results ---------------------------------------------------------
+
+
+class MatchMethod:
+    """String constants for SourceMatchResult.method and
+    InvoiceMatchResult.method. Kept as plain str so they grep cleanly
+    in logs."""
+    NO_INPUT       = 'no_input'         # source had no usable address
+    NO_MATCH       = 'no_match'         # 4-tuple lookup returned 0 rows
+    UNIQUE         = 'unique'           # 4-tuple lookup returned exactly 1 row
+    DISAMBIGUATED  = 'disambiguated'    # multi-row + name matrix picked one
+    AMBIGUOUS      = 'ambiguous'        # multi-row + name matrix below threshold
+
+    AGREE                 = 'agree'                  # both sources agreed
+    BOL_WINS_DISAGREEMENT = 'bol_wins_disagreement'  # both resolved, disagreed; BOL won
+    BOL_ONLY              = 'bol_only'               # only BOL resolved
+    INV_ONLY              = 'inv_only'               # only page-1 resolved
+    HARD_FAIL             = 'hard_fail'              # neither resolved
+    DENIED                = 'denied'                 # matched a deny-listed row
+
+
+@dataclass(frozen=True)
+class SourceMatchResult:
+    """Outcome of `run_match_for_source` against one extraction source."""
+    method: str
+    entry: Optional[MasterEntry] = None
+    score: Optional[int] = None
+    candidates: tuple[MasterEntry, ...] = ()
+    matrix: tuple[tuple[str, str, int], ...] = ()  # (cand, master_shipto_name, score)
+
+
+@dataclass(frozen=True)
+class InvoiceMatchResult:
+    """Final cross-source match for one invoice."""
+    customer_name: Optional[str]              # the answer; None on hard fail / denied
+    method: str
+    bol: SourceMatchResult                    # never None (NO_INPUT if not run)
+    inv: SourceMatchResult                    # never None (NO_INPUT if not run)
+    severity: str                             # 'ok' | 'info' | 'severe'
+    fail_reason: Optional[str] = None
+
+
+# ---- Matcher implementation ------------------------------------------------
+
+
+def _shipto_for(extraction):
+    """Extract the inner ShipTo from either an InvoiceExtraction or a
+    BolExtraction (or anything with a `.ship_to` attribute). Returns
+    None if no usable extraction."""
+    if extraction is None:
+        return None
+    return getattr(extraction, 'ship_to', None)
+
+
+def run_match_for_source(extraction, master: CustomerMaster) -> SourceMatchResult:
+    """Pure per-source matching. Caller passes ONE extraction (BOL or
+    page-1); we look up its ShipTo's 4-tuple address against the
+    master and, if multi-row, run the name-disambig matrix.
+
+    Knows nothing about BOL vs page-1 priority — that's the
+    orchestrator's concern.
+    """
+    ship_to = _shipto_for(extraction)
+    if ship_to is None or ship_to.address is None or not ship_to.address.street:
+        return SourceMatchResult(method=MatchMethod.NO_INPUT)
+
+    addr = ship_to.address
+    key4 = (addr.street, addr.city, addr.state, addr.postcode)
+    rows = master.lookup_address(key4)
+
+    if not rows:
+        return SourceMatchResult(method=MatchMethod.NO_MATCH)
+
+    if len(rows) == 1:
+        return SourceMatchResult(
+            method=MatchMethod.UNIQUE,
+            entry=rows[0],
+            candidates=(rows[0],),
+        )
+
+    # Multi-row → fuzzy name matrix over (cand × master_shipto_name).
+    cands = list(ship_to.name_candidates) if ship_to.name_candidates else []
+    if not cands and ship_to.name:
+        cands = [ship_to.name]
+    cands = [c for c in cands if c]  # drop empty strings
+
+    matrix: list[tuple[str, str, int]] = []
+    best_pair: Optional[tuple[str, MasterEntry]] = None
+    best_score = 0
+    for cand in cands:
+        cand_norm = _normalize_name(cand)
+        if not cand_norm:
+            continue
+        for row in rows:
+            row_norm = _normalize_name(row.shipto_name)
+            if not row_norm:
+                continue
+            score = int(round(fuzz.WRatio(cand_norm, row_norm)))
+            matrix.append((cand, row.shipto_name, score))
+            if score > best_score:
+                best_score = score
+                best_pair = (cand, row)
+
+    if best_pair is not None and best_score >= NAME_DISAMBIG_THRESHOLD:
+        return SourceMatchResult(
+            method=MatchMethod.DISAMBIGUATED,
+            entry=best_pair[1],
+            score=best_score,
+            candidates=tuple(rows),
+            matrix=tuple(matrix),
+        )
+
+    return SourceMatchResult(
+        method=MatchMethod.AMBIGUOUS,
+        score=best_score,
+        candidates=tuple(rows),
+        matrix=tuple(matrix),
+    )
+
+
+def _is_resolved(r: SourceMatchResult) -> bool:
+    return r.method in (MatchMethod.UNIQUE, MatchMethod.DISAMBIGUATED)
+
+
+def _check_deny_list(result: InvoiceMatchResult) -> InvoiceMatchResult:
+    """Post-match deny-list. If the matched customer is the
+    Highland Beef Farms Inventory pseudo-customer (rows 182, 183 —
+    internal one-offs, never a real billable customer), refuse the
+    match."""
+    if (result.customer_name and
+            _normalize_name(result.customer_name) == _HBF_INVENTORY_NORM):
+        return InvoiceMatchResult(
+            customer_name=None,
+            method=MatchMethod.DENIED,
+            bol=result.bol, inv=result.inv,
+            severity='severe',
+            fail_reason=(
+                f"matched HBF Inventory row ({result.customer_name!r}) — "
+                f"internal one-off, not a real customer"
+            ),
+        )
+    return result
+
+
+def match_invoice_customer(
+    invoice_extr,
+    bol_extr,
+    master: CustomerMaster,
+) -> InvoiceMatchResult:
+    """Stage-2 orchestrator. Runs both sources independently against
+    the master, then picks the best.
+
+    BOL is preferred when both sources resolve disagreeing customers
+    (per user policy: 'BOL is highly preferred'). Hard fails if no
+    source produced any address, or if neither source resolved a
+    customer.
+    """
+    bol_result = run_match_for_source(bol_extr, master)
+    inv_result = run_match_for_source(invoice_extr, master)
+
+    # Phase 0: pre-flight. At least ONE source must produce an address.
+    if (bol_result.method == MatchMethod.NO_INPUT
+            and inv_result.method == MatchMethod.NO_INPUT):
+        return InvoiceMatchResult(
+            customer_name=None,
+            method=MatchMethod.HARD_FAIL,
+            bol=bol_result, inv=inv_result,
+            severity='severe',
+            fail_reason='no usable address from invoice',
+        )
+
+    bol_resolved = _is_resolved(bol_result)
+    inv_resolved = _is_resolved(inv_result)
+
+    if bol_resolved and inv_resolved:
+        if bol_result.entry.customer_name == inv_result.entry.customer_name:
+            return _check_deny_list(InvoiceMatchResult(
+                customer_name=bol_result.entry.customer_name,
+                method=MatchMethod.AGREE,
+                bol=bol_result, inv=inv_result,
+                severity='ok',
+            ))
+        # Disagreement: BOL wins per user policy. Severity depends on
+        # whether both sources were UNIQUE (the strongest disagreement
+        # signal — independent address locks landed on different rows)
+        # vs. one of them having needed name disambig.
+        if (bol_result.method == MatchMethod.UNIQUE
+                and inv_result.method == MatchMethod.UNIQUE):
+            severity = 'severe'
+        else:
+            severity = 'info'
+        return _check_deny_list(InvoiceMatchResult(
+            customer_name=bol_result.entry.customer_name,
+            method=MatchMethod.BOL_WINS_DISAGREEMENT,
+            bol=bol_result, inv=inv_result,
+            severity=severity,
+        ))
+
+    if bol_resolved:
+        return _check_deny_list(InvoiceMatchResult(
+            customer_name=bol_result.entry.customer_name,
+            method=MatchMethod.BOL_ONLY,
+            bol=bol_result, inv=inv_result,
+            severity='ok',
+        ))
+
+    if inv_resolved:
+        return _check_deny_list(InvoiceMatchResult(
+            customer_name=inv_result.entry.customer_name,
+            method=MatchMethod.INV_ONLY,
+            bol=bol_result, inv=inv_result,
+            severity='ok',
+        ))
+
+    return InvoiceMatchResult(
+        customer_name=None,
+        method=MatchMethod.HARD_FAIL,
+        bol=bol_result, inv=inv_result,
+        severity='severe',
+        fail_reason='neither BOL nor consignee resolved a customer',
+    )
+
+
+def format_match_log(result: InvoiceMatchResult) -> str:
+    """Multi-line human-readable description of the match outcome.
+    Suitable for a per-invoice log when the case is non-trivial
+    (multi-row 4-tuple, BOL vs page-1 disagreement, etc.)."""
+    lines = []
+    lines.append(
+        f"customer match: method={result.method}  severity={result.severity}"
+    )
+    if result.customer_name:
+        lines.append(f"  customer_name: {result.customer_name!r}")
+    if result.fail_reason:
+        lines.append(f"  fail_reason:   {result.fail_reason}")
+
+    for label, src in [('BOL', result.bol), ('Page-1', result.inv)]:
+        lines.append(f"  --- {label} source ---")
+        lines.append(f"    method: {src.method}")
+        if src.entry is not None:
+            e = src.entry
+            lines.append(
+                f"    matched row {e.row}: customer_name={e.customer_name!r}  "
+                f"shipto_name={e.shipto_name!r}"
+            )
+            lines.append(
+                f"      address: street={e.address.street!r} "
+                f"city={e.address.city!r} state={e.address.state!r} "
+                f"postcode={e.address.postcode!r}"
+            )
+        if src.score is not None:
+            lines.append(f"    score: {src.score}  (threshold {NAME_DISAMBIG_THRESHOLD})")
+        if len(src.candidates) > 1:
+            lines.append(
+                f"    candidate rows ({len(src.candidates)}): "
+                + ', '.join(f'row {c.row} ({c.customer_name})' for c in src.candidates)
+            )
+        if src.matrix:
+            lines.append(f"    name matrix (sorted by score, highest first):")
+            for cand, shipto, score in sorted(src.matrix, key=lambda t: -t[2]):
+                lines.append(
+                    f"      WRatio({cand!r}, {shipto!r}) = {score}"
+                )
+
+    return '\n'.join(lines)
