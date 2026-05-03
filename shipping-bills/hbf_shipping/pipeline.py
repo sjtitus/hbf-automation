@@ -34,6 +34,7 @@ from .bol_ship_to import extract_ship_to
 from .customer_address_map import (
     InvoiceMatchResult,
     MatchMethod,
+    _format_address_summary,
     format_match_log,
     load_master,
     match_invoice_customer,
@@ -169,23 +170,38 @@ class Pipeline:
             logger.info(f"  raw_lines:       {bol.raw_lines}")
 
     def _log_match_outcome(self, match: InvoiceMatchResult):
-        """Always log the one-line match result. Log full details for
-        non-trivial cases (disagreements, hard fails, denied)."""
+        """Always log the headline (method + severity + the four
+        disambiguating identifiers when there's a matched entry). Log
+        the full source breakdown (per-source method, name matrix,
+        rejected-row diagnostic) only for non-trivial cases —
+        disagreements, hard fails, denied, or any disambig/ambiguous
+        per-source outcome. The disambiguating headline applies to
+        BOTH trivial and non-trivial cases — distributor matches like
+        Gold Star Foods need customer_id + master_row in the log
+        regardless of whether name disambig was used."""
         logger.info("\n--- CUSTOMER MATCH ---")
 
-        # One-line headline.
-        cn_repr = match.customer_name if match.customer_name else '<none>'
+        # Always: method + severity headline.
         logger.info(
-            f"  result: customer={cn_repr!r}  method={match.method}  "
-            f"severity={match.severity}"
+            f"  result: method={match.method}  severity={match.severity}"
         )
+
+        # Always (when there's a matched entry, success or DENIED):
+        # the four disambiguating identifiers.
+        e = match.matched_entry
+        if e is not None:
+            heading = 'rejected' if match.method == MatchMethod.DENIED else 'customer'
+            logger.info(f"  {heading}:    {e.customer_name!r}")
+            logger.info(f"  customer_id: {e.customer_number!r}")
+            logger.info(f"  master row:  {e.row}")
+            logger.info(f"  address:     {_format_address_summary(e.address)}")
+
         if match.fail_reason:
             logger.info(f"  fail_reason: {match.fail_reason}")
 
-        # Detail dump for non-trivial cases — this is the per-invoice
-        # log paying its keep. The detail block is written through
-        # `format_match_log` which renders the full per-source state
-        # plus the name-disambig matrix.
+        # Detail dump (per-source state + name matrix) only when the
+        # case is non-trivial — disagreements, hard fails, denied, or
+        # either source needed name disambig / went ambiguous.
         nontrivial = (
             match.method in _NONTRIVIAL_METHODS
             or match.bol.method == MatchMethod.DISAMBIGUATED
@@ -194,6 +210,11 @@ class Pipeline:
             or match.inv.method == MatchMethod.AMBIGUOUS
         )
         if nontrivial:
+            # format_match_log renders the headline AND per-source
+            # detail. We've already logged the headline above, so
+            # include format_match_log's output verbatim — the small
+            # duplication of headline lines is acceptable since
+            # format_match_log is also called from non-pipeline contexts.
             for line in format_match_log(match).splitlines():
                 logger.info(f"  {line}")
 

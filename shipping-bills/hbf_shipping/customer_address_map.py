@@ -189,13 +189,20 @@ class ValidationViolation:
 
 # Rule identifiers — kept as constants so the report has a stable
 # vocabulary and tests can refer to them.
-RULE_REQUIRED_FIELDS  = 'required_fields_present'    # hard
-RULE_TRIPLE_UNIQUE    = 'triple_unique'              # hard
-RULE_AL1_STRICT_PARSE = 'al1_strict_parse'           # soft
-RULE_NO_DASH_AL1      = 'no_dash_al1'                # soft
-RULE_SCOURGIFY_FALL   = 'scourgify_fallback'         # soft
+RULE_REQUIRED_FIELDS         = 'required_fields_present'      # hard
+RULE_TRIPLE_UNIQUE           = 'triple_unique'                # hard
+RULE_MISSING_CUSTOMER_NUMBER = 'missing_customer_number'      # hard
+RULE_DUPLICATE_CUSTOMER_NUMBER = 'duplicate_customer_number'  # hard
+RULE_AL1_STRICT_PARSE        = 'al1_strict_parse'             # soft
+RULE_NO_DASH_AL1             = 'no_dash_al1'                  # soft
+RULE_SCOURGIFY_FALL          = 'scourgify_fallback'           # soft
 
-_HARD_RULES = {RULE_REQUIRED_FIELDS, RULE_TRIPLE_UNIQUE}
+_HARD_RULES = {
+    RULE_REQUIRED_FIELDS,
+    RULE_TRIPLE_UNIQUE,
+    RULE_MISSING_CUSTOMER_NUMBER,
+    RULE_DUPLICATE_CUSTOMER_NUMBER,
+}
 
 
 # Per-row record built by the loader, consumed by validation.
@@ -219,6 +226,8 @@ def validate_master(records: list[_RowRecord]) -> list[ValidationViolation]:
     violations: list[ValidationViolation] = []
     violations.extend(_check_required_fields(records))
     violations.extend(_check_triple_unique(records))
+    violations.extend(_check_missing_customer_number(records))
+    violations.extend(_check_duplicate_customer_number(records))
     violations.extend(_check_al1_strict_parse(records))
     violations.extend(_check_no_dash_al1(records))
     violations.extend(_check_scourgify_fallback(records))
@@ -270,6 +279,62 @@ def _check_triple_unique(records: list[_RowRecord]) -> list[ValidationViolation]
             ))
         else:
             seen[key] = r.row
+    return out
+
+
+def _check_missing_customer_number(records: list[_RowRecord]) -> list[ValidationViolation]:
+    """Hard rule: every row MUST have a parseable HBF customer number.
+
+    The customer number is the canonical HBF customer ID — ridiculously
+    encoded inside AL1 rather than its own column, but it's the
+    identifier that matters for billing. A row without one is a real
+    data integrity gap that should be fixed in the spreadsheet.
+
+    This rule is more operationally meaningful than its two soft
+    cousins (`al1_strict_parse`, `no_dash_al1`), which describe HOW
+    the AL1 fails to yield a number. This rule says THAT the row has
+    no usable HBF customer ID.
+    """
+    out = []
+    for r in records:
+        if r.customer_number is None:
+            al1 = r.raw.get('AddressLine1')
+            out.append(ValidationViolation(
+                row=r.row, rule=RULE_MISSING_CUSTOMER_NUMBER, severity='hard',
+                message=(
+                    f"row has no parseable HBF customer number (AL1={al1!r})"
+                ),
+                raw=r.raw,
+            ))
+    return out
+
+
+def _check_duplicate_customer_number(records: list[_RowRecord]) -> list[ValidationViolation]:
+    """Hard rule: each HBF customer number must appear on at most one
+    row.
+
+    A customer number identifies one billing customer; two rows sharing
+    one is a real integrity violation (it would mean we can't tell from
+    the number alone which row to bill). Surfaces the FIRST row where
+    a given number was seen so the human can compare and decide which
+    is correct.
+    """
+    seen: dict[str, int] = {}
+    out = []
+    for r in records:
+        if r.customer_number is None:
+            continue  # missing-number rule covers these
+        prev = seen.get(r.customer_number)
+        if prev is not None:
+            out.append(ValidationViolation(
+                row=r.row, rule=RULE_DUPLICATE_CUSTOMER_NUMBER, severity='hard',
+                message=(
+                    f"customer number {r.customer_number} is also on row {prev}"
+                ),
+                raw=r.raw,
+            ))
+        else:
+            seen[r.customer_number] = r.row
     return out
 
 
@@ -383,11 +448,13 @@ def write_validation_report(
     lines.append("")
 
     rule_specs = [
-        (RULE_REQUIRED_FIELDS, 'hard', 'Required fields non-empty'),
-        (RULE_TRIPLE_UNIQUE,   'hard', 'Triple uniqueness (Name, shipto_name, address)'),
-        (RULE_AL1_STRICT_PARSE,'soft', 'AL1 strict-parse failure'),
-        (RULE_NO_DASH_AL1,     'soft', 'AL1 has no customer number assigned'),
-        (RULE_SCOURGIFY_FALL,  'soft', 'Scourgify-fallback addresses'),
+        (RULE_REQUIRED_FIELDS,           'hard', 'Required fields non-empty'),
+        (RULE_TRIPLE_UNIQUE,             'hard', 'Triple uniqueness (Name, shipto_name, address)'),
+        (RULE_MISSING_CUSTOMER_NUMBER,   'hard', 'Every row has an HBF customer number'),
+        (RULE_DUPLICATE_CUSTOMER_NUMBER, 'hard', 'Customer numbers are unique'),
+        (RULE_AL1_STRICT_PARSE,          'soft', 'AL1 strict-parse failure'),
+        (RULE_NO_DASH_AL1,               'soft', 'AL1 has no customer number assigned'),
+        (RULE_SCOURGIFY_FALL,            'soft', 'Scourgify-fallback addresses'),
     ]
 
     lines.append("=== HARD RULES ===")
@@ -1012,13 +1079,68 @@ class SourceMatchResult:
 
 @dataclass(frozen=True)
 class InvoiceMatchResult:
-    """Final cross-source match for one invoice."""
-    customer_name: Optional[str]              # the answer; None on hard fail / denied
+    """Final cross-source match for one invoice.
+
+    `matched_entry` is the canonical reference to the resolved master
+    row. It is populated for every successful match (AGREE / BOL_ONLY /
+    INV_ONLY / BOL_WINS_DISAGREEMENT) AND for DENIED (where it carries
+    the row that was rejected, for diagnostic visibility). It is None
+    only on HARD_FAIL.
+
+    Convenience accessors (`customer_name`, `customer_number`,
+    `address`, `master_row`) derive from `matched_entry`. The
+    `customer_name` property returns None for HARD_FAIL/DENIED so
+    `if result.customer_name:` still means "billable customer." The
+    `success` property is the affirmative test."""
+    matched_entry: Optional[MasterEntry]      # the resolved row; None on HARD_FAIL
     method: str
     bol: SourceMatchResult                    # never None (NO_INPUT if not run)
     inv: SourceMatchResult                    # never None (NO_INPUT if not run)
     severity: str                             # 'ok' | 'info' | 'severe'
     fail_reason: Optional[str] = None
+
+    @property
+    def customer_name(self) -> Optional[str]:
+        """The matched Customer Name. None on HARD_FAIL or DENIED
+        (where matched_entry may still carry the rejected row but it's
+        not a billable customer)."""
+        if self.method in (MatchMethod.HARD_FAIL, MatchMethod.DENIED):
+            return None
+        return self.matched_entry.customer_name if self.matched_entry else None
+
+    @property
+    def customer_number(self) -> Optional[str]:
+        """The HBF customer ID parsed from AL1. None on HARD_FAIL or
+        when the master row had no parseable customer number."""
+        if self.method in (MatchMethod.HARD_FAIL, MatchMethod.DENIED):
+            return None
+        return self.matched_entry.customer_number if self.matched_entry else None
+
+    @property
+    def address(self) -> Optional[NormalizedAddress]:
+        """The matched master row's NormalizedAddress. None on
+        HARD_FAIL or DENIED."""
+        if self.method in (MatchMethod.HARD_FAIL, MatchMethod.DENIED):
+            return None
+        return self.matched_entry.address if self.matched_entry else None
+
+    @property
+    def master_row(self) -> Optional[int]:
+        """1-indexed XLSX row of the matched master entry. None on
+        HARD_FAIL or DENIED."""
+        if self.method in (MatchMethod.HARD_FAIL, MatchMethod.DENIED):
+            return None
+        return self.matched_entry.row if self.matched_entry else None
+
+    @property
+    def success(self) -> bool:
+        """True iff a billable customer was identified. Affirmative
+        signal so callers can write `if result.success:` instead of
+        composing `result.customer_name is not None` or comparing
+        against method constants."""
+        return (self.matched_entry is not None
+                and self.method not in (MatchMethod.HARD_FAIL,
+                                        MatchMethod.DENIED))
 
 
 # ---- Matcher implementation ------------------------------------------------
@@ -1107,17 +1229,20 @@ def _check_deny_list(result: InvoiceMatchResult) -> InvoiceMatchResult:
     """Post-match deny-list. If the matched customer is the
     Highland Beef Farms Inventory pseudo-customer (rows 182, 183 —
     internal one-offs, never a real billable customer), refuse the
-    match."""
-    if (result.customer_name and
-            _normalize_name(result.customer_name) == _HBF_INVENTORY_NORM):
+    match. The rejected `matched_entry` is preserved so the human
+    reviewing the log can see what was almost-matched."""
+    if (result.matched_entry is not None
+            and _normalize_name(result.matched_entry.customer_name) == _HBF_INVENTORY_NORM):
+        rejected = result.matched_entry
         return InvoiceMatchResult(
-            customer_name=None,
+            matched_entry=rejected,            # keep for diagnostic
             method=MatchMethod.DENIED,
             bol=result.bol, inv=result.inv,
             severity='severe',
             fail_reason=(
-                f"matched HBF Inventory row ({result.customer_name!r}) — "
-                f"internal one-off, not a real customer"
+                f"matched HBF Inventory row {rejected.row} "
+                f"({rejected.customer_name!r}) — internal one-off, "
+                f"not a real customer"
             ),
         )
     return result
@@ -1143,7 +1268,7 @@ def match_invoice_customer(
     if (bol_result.method == MatchMethod.NO_INPUT
             and inv_result.method == MatchMethod.NO_INPUT):
         return InvoiceMatchResult(
-            customer_name=None,
+            matched_entry=None,
             method=MatchMethod.HARD_FAIL,
             bol=bol_result, inv=inv_result,
             severity='severe',
@@ -1156,7 +1281,7 @@ def match_invoice_customer(
     if bol_resolved and inv_resolved:
         if bol_result.entry.customer_name == inv_result.entry.customer_name:
             return _check_deny_list(InvoiceMatchResult(
-                customer_name=bol_result.entry.customer_name,
+                matched_entry=bol_result.entry,
                 method=MatchMethod.AGREE,
                 bol=bol_result, inv=inv_result,
                 severity='ok',
@@ -1171,7 +1296,7 @@ def match_invoice_customer(
         else:
             severity = 'info'
         return _check_deny_list(InvoiceMatchResult(
-            customer_name=bol_result.entry.customer_name,
+            matched_entry=bol_result.entry,
             method=MatchMethod.BOL_WINS_DISAGREEMENT,
             bol=bol_result, inv=inv_result,
             severity=severity,
@@ -1179,7 +1304,7 @@ def match_invoice_customer(
 
     if bol_resolved:
         return _check_deny_list(InvoiceMatchResult(
-            customer_name=bol_result.entry.customer_name,
+            matched_entry=bol_result.entry,
             method=MatchMethod.BOL_ONLY,
             bol=bol_result, inv=inv_result,
             severity='ok',
@@ -1187,14 +1312,14 @@ def match_invoice_customer(
 
     if inv_resolved:
         return _check_deny_list(InvoiceMatchResult(
-            customer_name=inv_result.entry.customer_name,
+            matched_entry=inv_result.entry,
             method=MatchMethod.INV_ONLY,
             bol=bol_result, inv=inv_result,
             severity='ok',
         ))
 
     return InvoiceMatchResult(
-        customer_name=None,
+        matched_entry=None,
         method=MatchMethod.HARD_FAIL,
         bol=bol_result, inv=inv_result,
         severity='severe',
@@ -1202,18 +1327,40 @@ def match_invoice_customer(
     )
 
 
+def _format_address_summary(addr: NormalizedAddress) -> str:
+    """One-line human-readable address: '<street>, <city>, <state> <zip>'
+    with line_2 appended as ' (<line_2>)' when non-empty."""
+    if addr is None:
+        return 'None'
+    base = f"{addr.street}, {addr.city}, {addr.state} {addr.postcode}"
+    if addr.line_2:
+        base += f" ({addr.line_2})"
+    return base
+
+
 def format_match_log(result: InvoiceMatchResult) -> str:
     """Multi-line human-readable description of the match outcome.
     Suitable for a per-invoice log when the case is non-trivial
-    (multi-row 4-tuple, BOL vs page-1 disagreement, etc.)."""
+    (multi-row 4-tuple, BOL vs page-1 disagreement, denied, etc.)."""
     lines = []
     lines.append(
         f"customer match: method={result.method}  severity={result.severity}"
     )
-    if result.customer_name:
-        lines.append(f"  customer_name: {result.customer_name!r}")
+
+    # Headline block: surface the four disambiguating identifiers when
+    # we have a matched_entry (success path or DENIED-with-rejected-row).
+    e = result.matched_entry
+    if e is not None:
+        # On DENIED, this is the REJECTED row, not a successful match —
+        # heading reflects that.
+        heading = 'rejected' if result.method == MatchMethod.DENIED else 'customer'
+        lines.append(f"  {heading}:    {e.customer_name!r}")
+        lines.append(f"  customer_id: {e.customer_number!r}")
+        lines.append(f"  master row:  {e.row}")
+        lines.append(f"  address:     {_format_address_summary(e.address)}")
+
     if result.fail_reason:
-        lines.append(f"  fail_reason:   {result.fail_reason}")
+        lines.append(f"  fail_reason: {result.fail_reason}")
 
     for label, src in [('BOL', result.bol), ('Page-1', result.inv)]:
         lines.append(f"  --- {label} source ---")

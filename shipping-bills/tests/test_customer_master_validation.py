@@ -23,6 +23,8 @@ from hbf_shipping.customer_address_map import (
     MasterValidationError,
     RULE_REQUIRED_FIELDS,
     RULE_TRIPLE_UNIQUE,
+    RULE_MISSING_CUSTOMER_NUMBER,
+    RULE_DUPLICATE_CUSTOMER_NUMBER,
     RULE_AL1_STRICT_PARSE,
     RULE_NO_DASH_AL1,
     RULE_SCOURGIFY_FALL,
@@ -250,12 +252,18 @@ def test_validation_report_summary_counts(synthetic_master_path, tmp_path):
     """The report's summary block reflects the right counts."""
     load_address_to_customers(synthetic_master_path, log_dir=tmp_path)
     log = (tmp_path / 'customer_master_validation.log').read_text()
-    # Row 5 = required_fields. Row 4 = triple_unique. Both hard.
-    assert 'Hard violations: 2' in log
-    # Soft: AL1 strict-parse fail (rows 6, 7), no-dash AL1 (row 8),
-    # scourgify fallback (probably row 10 'Old Highway 75').
-    # We don't pin exact soft count (scourgify is sensitive to its data
-    # model); just sanity-check Soft warnings appear.
+    # Hard violations on the fixture:
+    #   row 4: triple_unique (duplicate of row 2)
+    #   row 5: required_fields_present (Star Foods CSZ blank)
+    #   row 5: missing_customer_number (Star Foods AL1 no dash)
+    #   row 6: missing_customer_number (Lompoc - AL1 strict-parse fails)
+    #   row 7: missing_customer_number (Victorville #-prefix, parse fails)
+    #   row 8: missing_customer_number (Freshlunches no dash)
+    # Total hard = 6.
+    assert 'Hard violations: 6' in log
+    # Soft warnings include: AL1 strict-parse fail (rows 6, 7), no-dash
+    # AL1 (row 8), scourgify fallback (probably row 10). Don't pin exact
+    # count — just sanity-check the section appears.
     assert 'Soft warnings:' in log
 
 
@@ -303,3 +311,108 @@ def test_internal_hyphen_only_is_no_customer_number_not_strict_fail(tmp_path):
     assert '[WARN] AL1 strict-parse failure' not in log
     # The OK section header for that rule SHOULD be present (zero violations)
     assert '[OK] AL1 strict-parse failure' in log
+
+
+# ============================================================
+# New customer-number rules
+# ============================================================
+
+
+def test_missing_customer_number_fires_for_no_dash_row(tmp_path):
+    """Hard rule: every row needs a parseable HBF customer number.
+    A no-dash row gets parsed as `customer_number=None` and fires
+    RULE_MISSING_CUSTOMER_NUMBER (in addition to the soft no_dash_al1
+    rule)."""
+    rows = [
+        {'Name': 'Freshlunches', 'AddressLine1': 'Freshlunches',
+         'AddressLine2': '100 Main St', 'City': 'Austin',
+         'State': 'TX', 'Postcode': '78701'},
+    ]
+    path = _make_master(tmp_path, rows)
+    load_address_to_customers(path, log_dir=tmp_path)
+    log = (tmp_path / 'customer_master_validation.log').read_text()
+    assert 'rule=missing_customer_number' in log
+    assert 'row   2' in log
+    assert 'no parseable HBF customer number' in log
+
+
+def test_missing_customer_number_fires_for_strict_parse_failure(tmp_path):
+    """A row that has a customer-number separator but fails strict
+    parse (Lompoc-style 'Camp 208015' missing dash before number)
+    yields customer_number=None, so both al1_strict_parse (soft) AND
+    missing_customer_number (hard) fire."""
+    rows = [
+        {'Name': 'Lompoc FCC', 'AddressLine1': 'Lompoc FCC - Camp 208015',
+         'AddressLine2': '3705 W Klein Blvd', 'City': 'Lompoc',
+         'State': 'CA', 'Postcode': '93436'},
+    ]
+    path = _make_master(tmp_path, rows)
+    load_address_to_customers(path, log_dir=tmp_path)
+    log = (tmp_path / 'customer_master_validation.log').read_text()
+    assert 'rule=missing_customer_number' in log
+    assert 'rule=al1_strict_parse' in log
+
+
+def test_missing_customer_number_does_not_fire_for_clean_row(tmp_path):
+    """Sanity check: a row with a clean parseable customer number
+    does NOT trigger RULE_MISSING_CUSTOMER_NUMBER."""
+    rows = [
+        {'Name': 'Allenwood FCI',
+         'AddressLine1': 'Allenwood FCI - 203437, ATTN: Commissary',
+         'AddressLine2': '7700 White Deer Run Rd', 'City': 'Allenwood',
+         'State': 'PA', 'Postcode': '17810'},
+    ]
+    path = _make_master(tmp_path, rows)
+    load_address_to_customers(path, log_dir=tmp_path)
+    log = (tmp_path / 'customer_master_validation.log').read_text()
+    # The OK header line for the rule should be present; no violation
+    # entries.
+    assert '[OK] Every row has an HBF customer number' in log
+
+
+def test_duplicate_customer_number_fires_when_two_rows_share(tmp_path):
+    """Hard rule: each customer number appears on at most one row."""
+    rows = [
+        {'Name': 'Customer A', 'AddressLine1': 'Customer A - 999999',
+         'AddressLine2': '100 Main St', 'City': 'Austin',
+         'State': 'TX', 'Postcode': '78701'},
+        # Same customer number on a different row — violation.
+        {'Name': 'Customer B', 'AddressLine1': 'Customer B - 999999',
+         'AddressLine2': '200 Oak Ave', 'City': 'Houston',
+         'State': 'TX', 'Postcode': '77002'},
+    ]
+    path = _make_master(tmp_path, rows)
+    load_address_to_customers(path, log_dir=tmp_path)
+    log = (tmp_path / 'customer_master_validation.log').read_text()
+    assert 'rule=duplicate_customer_number' in log
+    assert 'row   3' in log     # row 3 is the duplicate
+    assert 'also on row 2' in log
+
+
+def test_duplicate_customer_number_does_not_fire_for_unique_numbers(tmp_path):
+    """Sanity check: distinct customer numbers across rows produce no
+    duplicate-number violations."""
+    rows = [
+        {'Name': 'Customer A', 'AddressLine1': 'Customer A - 111111',
+         'AddressLine2': '100 Main St', 'City': 'Austin',
+         'State': 'TX', 'Postcode': '78701'},
+        {'Name': 'Customer B', 'AddressLine1': 'Customer B - 222222',
+         'AddressLine2': '200 Oak Ave', 'City': 'Houston',
+         'State': 'TX', 'Postcode': '77002'},
+    ]
+    path = _make_master(tmp_path, rows)
+    load_address_to_customers(path, log_dir=tmp_path)
+    log = (tmp_path / 'customer_master_validation.log').read_text()
+    assert '[OK] Customer numbers are unique' in log
+
+
+def test_missing_and_duplicate_rules_are_hard(tmp_path):
+    """Both new rules are hard — they cause strict-mode to abort."""
+    rows = [
+        {'Name': 'Missing Number', 'AddressLine1': 'Missing Number',
+         'AddressLine2': '100 Main St', 'City': 'Austin',
+         'State': 'TX', 'Postcode': '78701'},
+    ]
+    path = _make_master(tmp_path, rows)
+    with pytest.raises(MasterValidationError):
+        load_address_to_customers(path, strict=True, log_dir=tmp_path)

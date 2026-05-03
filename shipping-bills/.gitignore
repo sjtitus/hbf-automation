@@ -32,6 +32,7 @@ tests/fixtures/*
 # --- Generated runtime artifacts ---
 logs/
 quickbooks-imports/
+master-validation-logs/
 
 # --- BOL extraction tool outputs (renders of real customer BOLs) ---
 ship_to_crops/

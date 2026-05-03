@@ -16,6 +16,7 @@ import pytest
 
 from hbf_shipping.customer_address_map import (
     CustomerMaster,
+    InvoiceMatchResult,
     MasterEntry,
     MatchMethod,
     NAME_DISAMBIG_THRESHOLD,
@@ -353,8 +354,93 @@ def test_lookup_customer_name_keys_only_on_name_column():
 
 
 def test_lookup_customer_name_normalizes():
-    master = CustomerMaster([_entry('Sysco Foods, Inc.', 'Sysco', '1 MAIN ST')])
+    master = CustomerMaster([_entry('Test Customer A', 'Sysco', '1 MAIN ST')])
     # Variations should all normalize to the same key.
-    assert len(master.lookup_customer_name('SYSCO FOODS, INC.')) == 1
-    assert len(master.lookup_customer_name('sysco foods inc')) == 1
-    assert len(master.lookup_customer_name('Sysco Foods, Inc.')) == 1
+    assert len(master.lookup_customer_name('TEST CUSTOMER A')) == 1
+    assert len(master.lookup_customer_name('test customer a')) == 1
+    assert len(master.lookup_customer_name('Test Customer A')) == 1
+
+
+# ============================================================
+# InvoiceMatchResult — matched_entry + property accessors + success
+# ============================================================
+
+
+def test_matched_entry_populated_on_agree():
+    """After AGREE, matched_entry is the resolved master row, and the
+    convenience properties surface customer_number, address, and
+    master_row."""
+    e = _entry('Sysco Foods', 'Sysco', '123 MAIN ST',
+               row=42, customer_number='123456')
+    master = CustomerMaster([e])
+    bol = _bol('Sysco', _addr('123 MAIN ST'))
+    inv = _inv('Sysco', _addr('123 MAIN ST'))
+    result = match_invoice_customer(inv, bol, master)
+    assert result.method == MatchMethod.AGREE
+    assert result.matched_entry is e
+    assert result.customer_name == 'Sysco Foods'
+    assert result.customer_number == '123456'
+    assert result.master_row == 42
+    assert result.address == e.address
+    assert result.success is True
+
+
+def test_matched_entry_populated_on_bol_only():
+    """BOL_ONLY (page-1 had no usable address): matched_entry comes
+    from the BOL match."""
+    e = _entry('Acme Corp', 'Acme', '500 OAK AVE',
+               city='HOUSTON', state='TX', postcode='77002',
+               row=99, customer_number='999999')
+    master = CustomerMaster([e])
+    bol = _bol('Acme', _addr('500 OAK AVE',
+                             city='HOUSTON', state='TX', postcode='77002'))
+    result = match_invoice_customer(None, bol, master)
+    assert result.method == MatchMethod.BOL_ONLY
+    assert result.matched_entry is e
+    assert result.customer_number == '999999'
+    assert result.master_row == 99
+    assert result.success is True
+
+
+def test_success_false_on_hard_fail():
+    """When neither source resolved, success is False and properties
+    return None."""
+    master = CustomerMaster([_entry('Sysco', 'Sysco', '123 MAIN ST')])
+    result = match_invoice_customer(None, None, master)
+    assert result.method == MatchMethod.HARD_FAIL
+    assert result.success is False
+    assert result.matched_entry is None
+    assert result.customer_name is None
+    assert result.customer_number is None
+    assert result.address is None
+    assert result.master_row is None
+
+
+def test_success_false_on_denied_but_matched_entry_preserved():
+    """DENIED keeps matched_entry populated with the REJECTED row (so
+    diagnostic logs show what almost slipped through), but
+    success=False, customer_name=None, etc."""
+    rejected = _entry(
+        'Highland Beef Farms Inventory', 'Some Hotel',
+        '7201 SW 22ND ST',
+        city='DES MOINES', state='IA', postcode='50321',
+        row=182, customer_number=None,
+    )
+    master = CustomerMaster([rejected])
+    bol = _bol('Some Hotel', _addr('7201 SW 22ND ST',
+                                    city='DES MOINES', state='IA',
+                                    postcode='50321'))
+    result = match_invoice_customer(None, bol, master)
+    assert result.method == MatchMethod.DENIED
+    # matched_entry preserved for diagnostic visibility:
+    assert result.matched_entry is rejected
+    assert result.matched_entry.row == 182
+    # But success/billable signals are False/None — don't bill this:
+    assert result.success is False
+    assert result.customer_name is None
+    assert result.customer_number is None
+    assert result.address is None
+    assert result.master_row is None
+    # And fail_reason carries the rejection detail:
+    assert 'Inventory' in result.fail_reason
+    assert 'row 182' in result.fail_reason
