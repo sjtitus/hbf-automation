@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Preview script: load the customer-address map XLSX and dump it to stdout
-for manual inspection. No assertions — just print what loaded.
+Preview script: load the customer master and dump it to stdout for
+manual inspection. No assertions — just print what loaded.
+
+Useful when adding a new vendor: spot-check that a customer is in the
+master before debugging why the matcher missed.
 
 Run from project root:
     python3 tools/dump_customer_addresses.py
@@ -18,60 +21,69 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hbf_shipping.customer_address_map import (  # noqa: E402
     DEFAULT_ADDRESS_FILE,
-    load_address_to_customers,
+    load_master,
 )
 
 
 def main() -> int:
-    # Surface the loader's skip count.
-    logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(name)s: %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
 
     print(f"Loading: {DEFAULT_ADDRESS_FILE}\n")
-    m = load_address_to_customers()
+    master = load_master()
 
-    total_entries = sum(len(v) for v in m.values())
     print(f"\n{'=' * 78}")
-    print(f"  {len(m)} unique addresses, {total_entries} customer-entries total")
+    print(f"  {len(master.entries)} entries / "
+          f"{len(master.by_address_4tuple)} unique 4-tuple addresses / "
+          f"{len(master.by_customer_name)} unique customer names")
     print(f"{'=' * 78}\n")
 
-    keys = sorted(m.keys(), key=lambda a: (a.state, a.city, a.street))
+    addrs = sorted(
+        master.by_address_4tuple.keys(),
+        key=lambda k: (k[1], k[0], k[2], k[3]),  # state, street, city, postcode — stable for visual scan
+    )
 
-    # Full dump
-    for addr in keys:
-        entries = m[addr]
-        print(f"  {addr.street}")
-        print(f"  {addr.city}, {addr.state} {addr.postcode}")
+    # Full dump — one block per unique 4-tuple address
+    for key in addrs:
+        entries = master.by_address_4tuple[key]
+        street, city, state, postcode = key
+        print(f"  {street}")
+        print(f"  {city}, {state} {postcode}")
         for e in entries:
-            print(f"    -> {e.name}   [shipto_name={e.shipto_name}]")
+            extra = (
+                f"   [cust#={e.customer_number}, row={e.row}]"
+                if e.customer_number else f"   [row={e.row}]"
+            )
+            print(f"    -> {e.customer_name}   [shipto_name={e.shipto_name}]{extra}")
         print()
 
-    # Multi-customer addresses
-    multi_cust = [(a, m[a]) for a in keys if len(m[a]) > 1]
+    # Multi-customer addresses — multi-tenant sites that need name disambig
+    multi_cust = [(k, v) for k, v in master.by_address_4tuple.items() if len(v) > 1]
     print(f"\n{'=' * 78}")
-    print(f"  Addresses shared by 2+ customers: {len(multi_cust)}")
+    print(f"  4-tuple addresses shared by 2+ customers: {len(multi_cust)}")
     print(f"{'=' * 78}\n")
-    for addr, entries in sorted(multi_cust, key=lambda x: -len(x[1])):
-        print(f"  {addr.street}, {addr.city}, {addr.state} {addr.postcode}  ({len(entries)} customers)")
+    for key, entries in sorted(multi_cust, key=lambda x: -len(x[1])):
+        street, city, state, postcode = key
+        print(f"  {street}, {city}, {state} {postcode}  ({len(entries)} customers)")
         for e in entries:
-            print(f"    -> {e.name}")
+            print(f"    -> {e.customer_name}   [shipto_name={e.shipto_name}]")
         print()
 
-    # Multi-address customers
-    by_name = defaultdict(list)
-    for addr, entries in m.items():
-        for entry in entries:
-            by_name[entry.name].append(addr)
+    # Multi-address customers — same Customer Name appearing on multiple rows
+    by_name: dict = defaultdict(list)
+    for e in master.entries:
+        by_name[e.customer_name].append(e)
     multi_addr = sorted(
-        ((n, a) for n, a in by_name.items() if len(a) > 1),
+        ((n, es) for n, es in by_name.items() if len(es) > 1),
         key=lambda x: (-len(x[1]), x[0]),
     )
     print(f"\n{'=' * 78}")
-    print(f"  Customers with 2+ addresses: {len(multi_addr)}")
+    print(f"  Customer Names appearing on 2+ rows: {len(multi_addr)}")
     print(f"{'=' * 78}\n")
-    for name, addrs in multi_addr:
-        print(f"  {name}  ({len(addrs)} addresses)")
-        for a in sorted(addrs, key=lambda x: (x.state, x.city, x.street)):
-            print(f"    -> {a.street}, {a.city}, {a.state} {a.postcode}")
+    for name, entries in multi_addr:
+        print(f"  {name}  ({len(entries)} rows)")
+        for e in sorted(entries, key=lambda x: (x.address.state, x.address.city, x.address.street)):
+            a = e.address
+            print(f"    -> {a.street}, {a.city}, {a.state} {a.postcode}   [row={e.row}]")
         print()
 
     return 0
