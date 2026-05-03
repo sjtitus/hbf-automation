@@ -12,18 +12,24 @@ This repository contains automation workflows for Highland Beef Farms (HBF) ship
 ## Common Commands
 
 Always run from the project root. Output directories (`logs/`,
-`processing-logs/`, `quickbooks-imports/`) are CWD-relative.
+`quickbooks-imports/`, `master-validation-logs/`) are CWD-relative.
+Always run inside the project venv (`venv/bin/python` or `source venv/bin/activate`).
 
 ### Process a directory of invoices (writes CSV)
 ```bash
-python3 process_badger.py <invoice-dir>
+venv/bin/python process_badger.py <invoice-dir>
 # equivalent:
-python3 -m hbf_shipping --vendor badger <invoice-dir>
+venv/bin/python -m hbf_shipping --vendor badger <invoice-dir>
 ```
 
-### Preview only (skip CSV write)
+### Preview only (skip bills CSV write)
 ```bash
-python3 process_badger.py --dry-run <invoice-dir>
+venv/bin/python process_badger.py --dry-run <invoice-dir>
+```
+
+### Validate the customer master without running invoices
+```bash
+venv/bin/python tools/validate_master.py [--strict]
 ```
 
 ### Install Dependencies
@@ -31,7 +37,7 @@ python3 process_badger.py --dry-run <invoice-dir>
 pip3 install -r requirements.txt
 ```
 
-The production path is page-1 text only — no system binaries required. `hbf_shipping/vendors/badger/ocr.py` is preserved for ad-hoc debugging of page-2 BOLs and shells out to `tesseract` if you exercise it (`brew install tesseract`); it is not invoked by `parse_invoice`.
+The production pipeline runs **both page-1 text extraction and page-2 BOL OCR** for every invoice. Tesseract is required (`brew install tesseract` on macOS). BOL OCR is the most fragile component; the regression suite exercises it on every fixture so future changes surface immediately.
 
 ## Architecture
 
@@ -40,30 +46,35 @@ The production path is page-1 text only — no system binaries required. `hbf_sh
 process_badger.py                      # Thin shim — injects --vendor badger and calls cli.main
 hbf_shipping/                          # The package
   cli.py                               # Argument parsing + vendor dispatch
-  pipeline.py                          # Vendor-agnostic per-invoice processing loop
+  pipeline.py                          # Vendor-agnostic per-invoice processing loop + finalize()
   bill_entry.py                        # Shared BillEntry dataclass (data only)
-  customer_address_map.py              # Address-aware customer lookup (production path)
-  customer_lookup.py                   # Legacy name-only validator (kept for tests/refresh_goldens)
+  ship_to.py                           # Canonical ShipTo / NormalizedAddress types + USPS Pub-28 normalization helpers (shared by both extractors)
+  bol_ship_to.py                       # Page-2 BOL OCR extractor — produces a canonical ShipTo
+  customer_address_map.py              # Customer-master loader, validator, and stage-2 matcher
   csv_export.py                        # Writes the QB-shaped batch-bills CSV
-  processing_log.py                    # Per-invoice processing-log CSV writer
+  processing_log.py                    # Per-invoice summary CSV writer (23 cols)
   run_logging.py                       # Per-run logging setup + per-invoice log handler + manifest writer
   vendors/
     __init__.py                        # VENDORS = {'badger': ...}
     badger/
-      __init__.py                      # Re-exports parse_invoice, build_bill_entry, REQUIRED_FIELDS, SHIPPING_COMPANY
-      parser.py                        # Page-1 text extraction (all fields, including structured address)
-      ocr.py                           # Page-2 BOL OCR — preserved for debugging; not on production path
+      __init__.py                      # Re-exports parse_invoice, extract_invoice_ship_to, build_bill_entry, REQUIRED_FIELDS, SHIPPING_COMPANY
+      parser.py                        # Page-1 text extraction (all fields, including structured ShipTo)
+      ocr.py                           # Page-2 BOL OCR — predates bol_ship_to.py, kept for ad-hoc debugging only
       rules.py                         # Badger business rules (bill-date, due-date, shipper→category)
 data/
-  hbf-customer-shipping-addresses.xlsx # Address-keyed customer master (production source)
-  hbf-customers.xls                    # Legacy name-only master (used by regression tests only)
-badger-invoices/                       # Drop-zone for Badger invoice PDFs
-quickbooks-imports/                    # Generated batch-bills CSVs (one per run)
-logs/<run-id>/                         # Per-run dir: run.log + <invoice>.log + summary.csv + manifest.json
+  hbf-customer-shipping-addresses.xlsx # Customer master (production source; gitignored)
+badger-invoices/                       # Drop-zone for Badger invoice PDFs (gitignored)
+quickbooks-imports/                    # Generated batch-bills CSVs, one per run (gitignored)
+logs/<run-id>/                         # Per-run dir: run.log + <invoice>.log + summary.csv + manifest.json + customer_master_validation.log
+master-validation-logs/                # Standalone validate_master.py outputs (gitignored)
 tools/
-  refresh_goldens.py                   # Regenerate tests/fixtures/<vendor>/<stem>.expected.json
-  dump_customer_addresses.py           # Eyeball dump of the customer-address map
-  match_consignees.py                  # Run parser+lookup against fixture PDFs, print outcomes
+  refresh_goldens.py                   # Regenerate tests/fixtures/<vendor>/<stem>.expected.json against the production matcher
+  validate_master.py                   # Standalone customer-master validator (no pipeline run needed)
+  dump_customer_addresses.py           # Eyeball dump of the customer master (post-load)
+  extract_ship_to_lines.py             # CLI wrapper over bol_ship_to.extract_ship_to (run production extractor over PDFs, write diagnostic PNGs)
+  find_ship_to_bounds.py               # Visualize anchor detection (where 'Bill of Lading Number' / 'Highland Beef Farms' anchors land per page)
+  crop_ship_to.py                      # Alternative full-page-OCR + label-anchor crop approach for cross-reference
+  read_ship_to.py                      # Paired with crop_ship_to.py: OCR cropped PNGs and parse address fields
 ```
 
 ### Vendor contract
@@ -85,7 +96,7 @@ Then add the vendor to `hbf_shipping/vendors/__init__.py::VENDORS` and (optional
 
 **PDF Processing**: Extracts structured data from vendor-specific invoice formats
 
-**Customer Matching**: Address-aware lookup against `data/hbf-customer-shipping-addresses.xlsx` (street + city + state + postcode → list of customers), with name-tier disambiguation when an address serves multiple customers and name-tier fallback when address fails entirely. See "Customer Matching Logic" below.
+**Customer Matching**: Stage-2 matcher consumes a page-1 `InvoiceExtraction` and a BOL `BolExtraction` and resolves to a single `MasterEntry` from `data/hbf-customer-shipping-addresses.xlsx`. Address match uses the exact 4-tuple (street + city + state + postcode); when the 4-tuple resolves to multiple master rows, a name-disambiguation matrix scores `name_candidates` against each row's `shipto_name`. BOL is preferred on cross-source disagreement. See "Customer Matching Logic" below.
 
 **Bill Entry Construction**: Each vendor's `rules.py` applies its own business logic and returns a shared `BillEntry`; `csv_export.py` writes those entries as a QuickBooks batch-bills CSV for manual import.
 
@@ -110,38 +121,52 @@ All fields come from page 1. The parser uses pypdf's plain `extract_text()` for 
 - **Total Amount**: Bottom right, "PLEASE PAY THIS AMOUNT"
 - **Past Due Date**: Bottom left, "THIS BILL IS PAST DUE ON"
 
-Page-2 BOL OCR was tried earlier (the page-1 consignee can be abbreviated, e.g. "FCI" vs. "Tucson FCI") but was retired because BOL image quality was inconsistent and produced silent wrong matches. `hbf_shipping/vendors/badger/ocr.py` is kept around for ad-hoc debugging only.
+Page-2 BOL OCR is part of the production path. `hbf_shipping/bol_ship_to.py` is the production extractor. `hbf_shipping/vendors/badger/ocr.py` is the older predecessor — kept around for ad-hoc debugging but not on the production code path.
 
 ### Customer Matching Logic
 
-The pipeline uses **address-aware matching** with a name-tier fallback. Source: `data/hbf-customer-shipping-addresses.xlsx` (one row per customer-address pairing; columns `Name | AddressLine1 | AddressLine2 | City | State | Postcode`). The loader (`hbf_shipping/customer_address_map.py`) keys by `(street, city, state, postcode)` so a single physical address that serves multiple customer entities (e.g. Butner FCC's 7 facilities) collapses into one bucket; `lookup_with_name_fallback` is the entry point.
+The pipeline uses **stage-2 address-first matching** with a name-disambiguation matrix. Source: `data/hbf-customer-shipping-addresses.xlsx` (columns `Name | AddressLine1 | AddressLine2 | City | State | Postcode`). The loader (`hbf_shipping/customer_address_map.py::load_master`) builds a `CustomerMaster` with two indexes:
+- `by_address_4tuple`: `(street, city, state, postcode)` → list of `MasterEntry` (multi-tenant addresses collapse here)
+- `by_customer_name`: normalized Customer Name → entries (used by `lookup_customer_name`)
 
-**Address tier** (primary):
-1. Exact match on the normalized 4-tuple (street normalized via `usaddress-scourgify` per USPS Pub 28: `Rd↔Road`, `W↔WEST`, suite-info split, etc.).
-2. On miss, fuzzy match within the `(city, state, postcode)` bucket using `rapidfuzz.fuzz.token_set_ratio` (threshold 85). Hard-filtered by leading street number — different number ⇒ different address, no fuzzing.
+Each invoice produces two source records: page-1 `InvoiceExtraction` (`vendor.extract_invoice_ship_to`) and page-2 `BolExtraction` (`bol_ship_to.extract_ship_to`). Both feed `match_invoice_customer(inv, bol, master)` → `InvoiceMatchResult`.
 
-**Name tier** (used in two places):
-- *Disambiguator* — when the address tier returns multiple candidates at one address, the consignee name is matched against those N candidates (4 tiers: exact / case-insensitive / normalized / `rapidfuzz.fuzz.WRatio` ≥ 88) to narrow to one.
-- *Fallback* — when the address tier produces no match at all (different street number, missing fields, etc.), the same 4 tiers run against the full `Name` column.
+**Per-source flow** (`run_match_for_source`):
+1. No address → `NO_INPUT`.
+2. Exact 4-tuple lookup. 0 rows → `NO_MATCH`. 1 row → `UNIQUE` (locked on, do not check name).
+3. Multi-row 4-tuple → name-disambig matrix: for each pair `(cand in ship_to.name_candidates, row in matched rows)`, score `fuzz.WRatio(_normalize_name(cand), _normalize_name(row.shipto_name))`. Best ≥ `NAME_DISAMBIG_THRESHOLD` (75) → `DISAMBIGUATED`. Else → `AMBIGUOUS`.
 
-**Generic-consignee guard**: when the consignee normalizes to `'federal correctional institution'` (a phrase the BOL uses for several different facilities), name matching is skipped on both paths — too generic to disambiguate safely.
+**Cross-source policy** (`match_invoice_customer`):
+1. Both `NO_INPUT` → `HARD_FAIL`.
+2. Both resolved + agree → `AGREE`.
+3. Both resolved + disagree → `BOL_WINS_DISAGREEMENT`. Severity `severe` if both were `UNIQUE` (strongest signal of data inconsistency); `info` otherwise.
+4. Only one resolved → `BOL_ONLY` or `INV_ONLY`.
+5. Neither resolved → `HARD_FAIL`.
 
-**Outcomes** (the `CustomerMatch: Method` value in the summary CSV):
+**Deny-list**: `customer_name == 'Highland Beef Farms Inventory'` (rows 182, 183 — internal one-offs) → `DENIED` regardless of how the match resolved. The rejected `MasterEntry` is preserved on the result for diagnostic visibility.
+
+**Outcomes** (the `Match Method` value in `summary.csv`):
+
 | Method | What happened |
 |---|---|
-| `address_exact` | Exact 4-tuple match, single customer |
-| `address_fuzzy` | Fuzzy address match, single customer |
-| `address_disambiguated_by_name` | Multi-match address narrowed to one by the consignee name |
-| `name_fallback` | Address tier missed, name tier found a customer |
-| `multi_match_unresolved` | Multiple candidates and name couldn't (or wasn't allowed to) narrow them |
-| `no_match` | Neither tier produced a match |
+| `agree` | BOL and page-1 both resolved to the same master row |
+| `bol_wins_disagreement` | Both sources resolved but to different rows; BOL wins per policy |
+| `bol_only` | Only BOL produced a usable address; matched on it |
+| `inv_only` | Only page-1 produced a usable address; matched on it |
+| `hard_fail` | Neither source resolved |
+| `denied` | Match resolved to the HBF Inventory pseudo-customer; rejected |
 
-`SUCCESS` requires exactly one matched customer (`address_exact`, `address_fuzzy`, `address_disambiguated_by_name`, or `name_fallback` with one entry). `multi_match_unresolved` and `no_match` are `FAIL`s, with the `Fail Message` describing why.
+Per-source method (recorded in `BOL Method` / `Page-1 Method`): `no_input`, `no_match`, `unique`, `disambiguated`, `ambiguous`. `Score` columns carry the WRatio when the disambig matrix ran, else empty.
+
+`SUCCESS` requires `match.matched_entry is not None` AND `method` not in `{hard_fail, denied}`. The `success` property on `InvoiceMatchResult` is the affirmative test used by callers.
 
 ### Inspection tools
 
-- `python3 tools/dump_customer_addresses.py` — load the XLSX and dump the address map (sorted by state/city/street, plus multi-customer/multi-address callouts) for eyeball validation.
-- `python3 tools/match_consignees.py` — run the parser + lookup against every PDF in `tests/fixtures/badger/`, print extraction + match outcome (and best near-miss when no match).
+- `venv/bin/python tools/validate_master.py [--strict]` — run the customer-master validator without invoking the invoice pipeline. Writes `master-validation-logs/<timestamp>/customer_master_validation.log`.
+- `venv/bin/python tools/dump_customer_addresses.py` — load the master and dump it grouped by 4-tuple address; multi-customer addresses and multi-row customers are called out separately. Useful for spot-checking before a vendor add.
+- `venv/bin/python tools/extract_ship_to_lines.py <pdf>...` — run the production BOL extractor over a set of PDFs and write diagnostic PNGs. First reach when BOL extraction is misbehaving on a new fixture.
+- `venv/bin/python tools/find_ship_to_bounds.py <pdf>...` — visualize the anchor detection (Bill-of-Lading-Number + Highland Beef Farms anchors). Reach when the BOL crop is wrong and you need to see why.
+- `venv/bin/python tools/crop_ship_to.py <pdf>...` + `tools/read_ship_to.py` — alternative crop+OCR pipeline (different approach from production), useful for cross-reference when production gets a wrong answer.
 
 ### QuickBooks Bill Entry Field Mapping
 
@@ -194,37 +219,44 @@ From the example PDF `Badger-example-Invoice0064452.pdf`:
 
 ### Testing
 
-Regression test suite under `tests/`. Pattern: end-to-end golden-file comparison — each test PDF in `tests/fixtures/<vendor>/` has a paired `<stem>.expected.json` snapshot of the full pipeline output (parsed `invoice_data`, `customer_matched`, and `bill_entry`). pytest parametrizes one test case per fixture pair.
+Three test suites under `tests/`:
+
+- **`test_vendor_regression.py`** — end-to-end golden-file comparison. Each PDF in `tests/fixtures/<vendor>/` has a paired `<stem>.expected.json` snapshot capturing `invoice_data`, a `customer_match` block (customer_name, customer_number, master_row, match_method, severity, bol_method, page1_method), and `bill_entry`. The test runs the production stack: `vendor.parse_invoice` → page-1 ShipTo → page-2 BOL OCR → `match_invoice_customer` → `build_bill_entry`. **BOL OCR is included on purpose** — same tesseract on the same PDF is deterministic, and the BOL extractor is the most fragile component, so regression is exactly where we want it exercised.
+- **`test_pipeline_integration.py`** — covers the artifact-emitting layer (summary CSV, bills CSV, manifest) using a stub vendor + synthetic master. Fast, no PDFs.
+- **`test_customer_master_validation.py`** + **`test_customer_match.py`** — unit tests for the loader + validator + matcher.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                              # all
-pytest -k badger                    # one vendor
-python3 tools/refresh_goldens.py    # regenerate goldens (review diff before committing)
-python3 tools/refresh_goldens.py badger 0064452   # one PDF only
+venv/bin/python -m pytest                                # all (~2 min — OCR-bound)
+venv/bin/python -m pytest -k 'not vendor_regression'     # skip OCR (sub-second)
+venv/bin/python -m pytest tests/test_vendor_regression.py -v
+venv/bin/python tools/refresh_goldens.py                 # regenerate ALL goldens (review diff)
+venv/bin/python tools/refresh_goldens.py badger 0064452  # one PDF only
 ```
 
 PDFs and goldens are gitignored (real customer data). The harness scales to additional vendors with zero code changes — drop PDFs into `tests/fixtures/<vendor>/`, refresh goldens, run pytest.
 
 ### Execution modes
 
-- **default** — parse + business rules, print a CSV-field preview, and write `quickbooks-imports/bills-<vendor>-YYYYMMDD-HHMMSS.csv`.
-- **`--dry-run`** — parse + business rules + print the preview only. No bills CSV written.
+- **default** — full pipeline (parse + validate + extract + match + build bill), writes `summary.csv`, `manifest.json`, per-invoice logs, customer-master validation log, AND `quickbooks-imports/bills-<run-id>.csv`.
+- **`--dry-run`** — same pipeline, summary + manifest still written, bills CSV is **suppressed** and a vertical bills preview is logged instead. Useful for verifying outcomes before producing a QB import file.
+- **`--strict-master`** — abort startup if the customer-master validator finds any hard violation. Validation log is written either way.
 
 ### Run artifacts
 
-Every run produces a self-contained directory at `logs/<run-id>/`, plus (in non-dry-run mode) a bills CSV at `quickbooks-imports/`.
+Every run produces a self-contained directory at `logs/<run-id>/`, plus (in non-dry-run mode) a bills CSV at `quickbooks-imports/bills-<run-id>.csv`.
 
 **run-id format**: `<vendor>-YYYY-MM-DDTHH-MM-SSET-XXXXXX`
 e.g. `badger-2026-04-25T09-30-45ET-a3f9c1`. Wall-clock US Eastern with literal `ET` suffix; 6-hex random tail makes same-second collisions effectively impossible. Sortable lexicographically into chronological order.
 
 **Inside `logs/<run-id>/`:**
 - `run.log` — INFO+ run-wide log, mirrors stdout.
-- `<invoice-stem>.log` — DEBUG+ log scoped to one invoice, written through a flushing FileHandler so partial output survives a crash. The first place to look when an invoice breaks. Captures parser extractor results (per-field value or failure reason), customer-lookup match tier, business-rule branches, and full exception tracebacks.
-- `summary.csv` — one row per PDF, 23 columns:
-  `Run ID, Shipping Company, Invoice File, Processing Start, Processing End, Status, Bill Number, SO Number, Consignee, CustomerMatch: PDF Address, CustomerMatch: Method, CustomerMatch: Score, CustomerMatch: Count, CustomerMatch: Matched, CustomerMatch: Near Miss, CustomerMatch: Near Miss Score, NameMatch: Method, NameMatch: Score, Total Amount, Log File, Fail Step, Fail Message, Fail Detail`.
-  Status is `SUCCESS` or `FAIL`; the extracted fields are populated best-effort even on FAIL. The 8 `CustomerMatch:` columns describe how the match was reached (see "Customer Matching Logic" above) — `Method` is one of the 6 outcomes, `Score` is the address-tier score, `Count` is how many customers matched, `Matched` is the pipe-separated list of canonical Names, and the two `Near Miss` columns hold the closest non-matching candidate when `Method=no_match`. The 2 `NameMatch:` columns describe the name tier when name was used (`Method` ∈ `exact`/`case_insensitive`/`normalized`/`fuzzy`/`tried_failed`/`n/a`; `Score` is 100 for tiers 1–3, the WRatio for tier 4). `Log File` points to the per-invoice log. On `FAIL`, `Fail Step` identifies where the failure occurred (`parse_pdf`, `validate_fields`, `customer_lookup`, or `build_bill_entry`); `Fail Detail` carries the specific extractor reason for `validate_fields` failures (e.g. "no match for pattern 'S[O0]-<digits>'"); otherwise `N/A`. For `customer_lookup` failures, `Fail Message` distinguishes multi-match-unresolved (with the disambiguator status) from no_match (with near-miss info).
-- `manifest.json` — machine-readable index of artifacts (run id, vendor, totals, paths to per-invoice logs, bills CSV, summary CSV). Future cloud worker uses this as the job-result document.
+- `<invoice-stem>.log` — DEBUG+ log scoped to one invoice, written through a flushing FileHandler so partial output survives a crash. First place to look when an invoice breaks. Captures parser extractor results (per-field value or failure reason), the cross-source match outcome (with full per-source breakdown for non-trivial cases), business-rule branches, and full exception tracebacks.
+- `customer_master_validation.log` — the validation report run at startup against `data/hbf-customer-shipping-addresses.xlsx`. Hard rules: `required_fields_present`, `triple_unique`, `could_not_extract_customer_number`. Soft rules: `duplicate_customer_number`, `malformed_customer_number_format`. AL1 cells with malformed format but a recoverable 6-digit customer number land under the soft rule (number is usable; cell should be reformatted). See `tools/validate_master.py` for standalone runs.
+- `summary.csv` — one row per PDF, **23 columns**:
+  `Run ID, Shipping Company, Invoice File, Processing Start, Processing End, Status, Bill Number, SO Number, Total Amount, Match Method, Match Severity, Customer Name, Customer Number, Master Row, BOL Method, BOL Score, Page-1 Method, Page-1 Score, Fail Step, Fail Message, Fail Detail, Log File, Match Fail Reason`.
+  Status is `SUCCESS` (when a `BillEntry` was built) or `FAIL`. `Match Method` is one of `agree`, `bol_wins_disagreement`, `bol_only`, `inv_only`, `hard_fail`, `denied` (see Customer Matching Logic). `Match Severity` is `ok`/`info`/`severe`. `Customer Name`, `Customer Number`, and `Master Row` come from the resolved `MasterEntry` and are blank on `hard_fail`/`denied`. `BOL Method` / `Page-1 Method` describe each source's outcome (`no_input`/`no_match`/`unique`/`disambiguated`/`ambiguous`); the `*Score` columns carry the name-disambig WRatio when the matrix ran, else empty. On `FAIL`, `Fail Step` identifies where the invoice fell off (`parse_pdf` / `validate_fields` / `extract_ship_to` / `match_customer` / `build_bill_entry`) and `Fail Detail` / `Fail Message` carry specifics. `Match Fail Reason` carries `match.fail_reason` (populated on `hard_fail` / `denied`).
+- `manifest.json` — machine-readable index of artifacts (run id, vendor, started/ended timestamps, totals, absolute paths to run log, summary CSV, validation log, bills CSV, per-invoice logs).
 
 **Outside the run dir:**
 - `quickbooks-imports/bills-<run-id>.csv` — the QuickBooks batch-bills import (default mode only). Filename embeds the run-id so you can correlate a bills CSV back to its run dir.
@@ -248,11 +280,13 @@ Batch processing aggregates every invoice in the run into a single CSV (single i
 
 ### Technology Stack
 - **Python 3.14+**
-- **pypdf** — PDF text extraction
-- **openpyxl** — read `hbf-customer-shipping-addresses.xlsx` (production source)
-- **xlrd** — read legacy `hbf-customers.xls` (test path only)
+- **pypdf** — PDF text extraction (page-1 invoice fields)
+- **pytesseract** + **tesseract** — page-2 BOL OCR
+- **opencv-python** + **Pillow** — BOL image preprocessing for OCR
+- **PyMuPDF (fitz)** — high-DPI rendering of page 2
+- **openpyxl** — read `hbf-customer-shipping-addresses.xlsx`
 - **usaddress-scourgify** — USPS Pub 28 address normalization (suffix abbreviations, directional collapsing, suite splitting)
-- **rapidfuzz** — `token_set_ratio` for fuzzy address matching, `WRatio` for fuzzy name matching
+- **rapidfuzz** — `WRatio` for the name-disambiguation matrix
 - **python-dateutil** — date parsing
 
 ## Important Business Rules
