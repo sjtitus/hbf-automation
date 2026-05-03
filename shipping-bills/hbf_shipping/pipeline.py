@@ -30,7 +30,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from .bill_entry import BillEntry
 from .bol_ship_to import extract_ship_to
+from .csv_export import format_bills_preview, write_bills_csv
 from .customer_address_map import (
     InvoiceMatchResult,
     MatchMethod,
@@ -39,7 +41,8 @@ from .customer_address_map import (
     load_master,
     match_invoice_customer,
 )
-from .run_logging import invoice_logger
+from .processing_log import build_summary_row, write_processing_log
+from .run_logging import invoice_logger, write_manifest
 
 
 logger = logging.getLogger(__name__)
@@ -56,13 +59,32 @@ _NONTRIVIAL_METHODS = frozenset({
 })
 
 
+_FAIL_STEP_PARSE       = 'parse_pdf'
+_FAIL_STEP_VALIDATE    = 'validate_fields'
+_FAIL_STEP_EXTRACT     = 'extract_ship_to'
+_FAIL_STEP_MATCH       = 'match_customer'
+_FAIL_STEP_BILL        = 'build_bill_entry'
+
+
 @dataclass(frozen=True)
 class InvoiceOutcome:
-    """One row of the batch summary."""
+    """One row of the batch summary. Fully describes one invoice's
+    journey through the pipeline — what was parsed, what was matched,
+    where (if anywhere) it failed, and the resulting BillEntry on
+    success. Consumed by `Pipeline.finalize` to emit the QB CSV +
+    summary CSV + manifest."""
     pdf_path: Path
-    inv: object                  # InvoiceExtraction or None
-    bol: object                  # BolExtraction or None
+    invoice_data: Optional[dict]              # vendor.parse_invoice output, if it ran
+    inv: object                               # InvoiceExtraction or None
+    bol: object                               # BolExtraction or None
     match: Optional[InvoiceMatchResult]
+    log_path: Path                            # per-invoice .log path
+    processing_start: str                     # ISO8601
+    processing_end: str                       # ISO8601
+    fail_step: Optional[str]                  # one of _FAIL_STEP_* or None
+    fail_message: Optional[str]
+    fail_detail: Optional[str]
+    bill_entry: Optional[BillEntry]           # populated only on full-pipeline success
 
 
 def _fmt_addr(addr) -> str:
@@ -88,8 +110,10 @@ class Pipeline:
     """
 
     def __init__(self, vendor, run_id: str, run_dir: Path,
+                 vendor_slug: str,
                  strict_master: bool = False):
         self.vendor = vendor
+        self.vendor_slug = vendor_slug
         self.run_id = run_id
         self.run_dir = run_dir
         self.diagnostic_dir = run_dir / 'shipto_diagnostics'
@@ -102,45 +126,117 @@ class Pipeline:
         self.master = load_master(strict=strict_master, log_dir=run_dir)
 
     def process_invoice(self, pdf_path) -> bool:
-        """Run extraction + customer matching on one PDF.
-
-        Returns True on a successful match (`match.customer_name` is
-        not None and method is not HARD_FAIL/DENIED).
-        """
+        """Run extraction + customer matching + bill-entry build on one
+        PDF. Returns True iff every stage succeeded (bill_entry is
+        populated). Always appends an `InvoiceOutcome` to `self.outcomes`
+        capturing where (if anywhere) the invoice fell off the path."""
         pdf_path = Path(pdf_path)
 
-        with invoice_logger(self.run_dir, pdf_path.stem):
+        invoice_data: Optional[dict] = None
+        inv = None
+        bol = None
+        match: Optional[InvoiceMatchResult] = None
+        bill_entry: Optional[BillEntry] = None
+        fail_step: Optional[str] = None
+        fail_message: Optional[str] = None
+        fail_detail: Optional[str] = None
+
+        processing_start = datetime.now().isoformat(timespec='seconds')
+
+        with invoice_logger(self.run_dir, pdf_path.stem) as log_path:
             logger.info(f"\n{'='*70}")
             logger.info(f"Processing invoice: {pdf_path.name}")
             logger.info(f"{'='*70}")
 
+            # Stage 1: parse PDF
             try:
-                invoice_data, _reasons = self.vendor.parse_invoice(str(pdf_path))
+                invoice_data, reasons = self.vendor.parse_invoice(str(pdf_path))
             except Exception as e:
                 logger.error(f"parse_invoice raised: {e}", exc_info=True)
-                self.outcomes.append(InvoiceOutcome(pdf_path, None, None, None))
-                return False
+                fail_step = _FAIL_STEP_PARSE
+                fail_message = f"parse_invoice raised {type(e).__name__}"
+                fail_detail = str(e)
 
-            inv = None
-            try:
-                inv = self.vendor.extract_invoice_ship_to(pdf_path, invoice_data)
-            except Exception as e:
-                logger.error(f"extract_invoice_ship_to raised: {e}", exc_info=True)
+            # Stage 2: validate required fields
+            if fail_step is None:
+                missing_field, missing_reason = self._first_missing_required(
+                    invoice_data, reasons,
+                )
+                if missing_field is not None:
+                    fail_step = _FAIL_STEP_VALIDATE
+                    fail_message = f"required field missing: {missing_field}"
+                    fail_detail = missing_reason or f"{missing_field} not extracted"
+                    logger.error(
+                        f"validate_fields failed: {fail_message} "
+                        f"({fail_detail})"
+                    )
 
-            bol = None
-            try:
-                bol = extract_ship_to(pdf_path, diagnostic_dir=self.diagnostic_dir)
-            except Exception as e:
-                logger.error(f"extract_ship_to (BOL) raised: {e}", exc_info=True)
+            # Stage 3: extract ship-to (page-1 + BOL). Both are
+            # best-effort; the matcher tolerates None on either side.
+            # An exception inside an extractor is logged but does NOT
+            # short-circuit the pipeline — the matcher will see None.
+            if fail_step is None:
+                try:
+                    inv = self.vendor.extract_invoice_ship_to(pdf_path, invoice_data)
+                except Exception as e:
+                    logger.error(f"extract_invoice_ship_to raised: {e}", exc_info=True)
+                try:
+                    bol = extract_ship_to(pdf_path, diagnostic_dir=self.diagnostic_dir)
+                except Exception as e:
+                    logger.error(f"extract_ship_to (BOL) raised: {e}", exc_info=True)
 
-            self._log_extraction_summary(inv, bol)
+                self._log_extraction_summary(inv, bol)
 
-            # Run the matcher.
-            match = match_invoice_customer(inv, bol, self.master)
-            self._log_match_outcome(match)
+            # Stage 4: match against customer master
+            if fail_step is None:
+                match = match_invoice_customer(inv, bol, self.master)
+                self._log_match_outcome(match)
+                if not match.success:
+                    fail_step = _FAIL_STEP_MATCH
+                    fail_message = (
+                        f"customer match failed: method={match.method}"
+                    )
+                    fail_detail = match.fail_reason or ''
 
-            self.outcomes.append(InvoiceOutcome(pdf_path, inv, bol, match))
-            return match.customer_name is not None
+            # Stage 5: build bill entry
+            if fail_step is None:
+                try:
+                    bill_entry = self.vendor.build_bill_entry(
+                        invoice_data, match.customer_name,
+                    )
+                except Exception as e:
+                    logger.error(f"build_bill_entry raised: {e}", exc_info=True)
+                    fail_step = _FAIL_STEP_BILL
+                    fail_message = f"build_bill_entry raised {type(e).__name__}"
+                    fail_detail = str(e)
+
+        processing_end = datetime.now().isoformat(timespec='seconds')
+
+        outcome = InvoiceOutcome(
+            pdf_path=pdf_path,
+            invoice_data=invoice_data,
+            inv=inv, bol=bol,
+            match=match,
+            log_path=log_path,
+            processing_start=processing_start,
+            processing_end=processing_end,
+            fail_step=fail_step,
+            fail_message=fail_message,
+            fail_detail=fail_detail,
+            bill_entry=bill_entry,
+        )
+        self.outcomes.append(outcome)
+        return bill_entry is not None
+
+    def _first_missing_required(self, invoice_data, reasons):
+        """Return `(field_name, reason)` for the first REQUIRED_FIELDS
+        entry that's missing in `invoice_data`, or `(None, None)` if
+        all are present. The `reasons` dict from `vendor.parse_invoice`
+        carries the extractor's specific failure reason per field."""
+        for field in self.vendor.REQUIRED_FIELDS:
+            if invoice_data.get(field) is None:
+                return field, (reasons or {}).get(field)
+        return None, None
 
     def _log_extraction_summary(self, inv, bol):
         """One-screen summary of what came out of the two extractors."""
@@ -298,3 +394,74 @@ class Pipeline:
         )
         logger.info(f"BOL diagnostic PNGs: {self.diagnostic_dir}/")
         logger.info(f"{'='*100}\n")
+
+    def finalize(self, *, dry_run: bool) -> dict[str, Path]:
+        """Emit run artifacts. Always writes summary.csv + manifest.json.
+        Writes the QuickBooks bills CSV unless `dry_run` is set, in
+        which case the bill-entry preview is logged instead.
+
+        Returns a dict mapping artifact key → absolute path."""
+        artifacts: dict[str, Path] = {}
+
+        bill_dicts = [
+            o.bill_entry.to_dict() for o in self.outcomes
+            if o.bill_entry is not None
+        ]
+
+        # Bills CSV: only when at least one bill built and not dry-run
+        if bill_dicts and not dry_run:
+            bills_path = (
+                Path('quickbooks-imports') / f'bills-{self.run_id}.csv'
+            )
+            write_bills_csv(bill_dicts, bills_path)
+            artifacts['bills_csv'] = bills_path.resolve()
+            logger.info(f"\nBills CSV: {bills_path}  ({len(bill_dicts)} entries)")
+        elif dry_run and bill_dicts:
+            logger.info("\n--- DRY RUN: bills preview (no CSV written) ---")
+            logger.info(format_bills_preview(bill_dicts))
+        elif not bill_dicts:
+            logger.info("\nNo successful bill entries — bills CSV skipped.")
+
+        # Summary CSV: always
+        summary_path = self.run_dir / 'summary.csv'
+        rows = [
+            build_summary_row(o, self.run_id, self.vendor.SHIPPING_COMPANY)
+            for o in self.outcomes
+        ]
+        write_processing_log(rows, summary_path)
+        artifacts['summary_csv'] = summary_path.resolve()
+
+        # Manifest: always
+        manifest_path = write_manifest(self.run_dir, self._manifest_payload(artifacts))
+        artifacts['manifest'] = manifest_path.resolve()
+
+        return artifacts
+
+    def _manifest_payload(self, artifacts: dict[str, Path]) -> dict:
+        n = len(self.outcomes)
+        n_succeeded = sum(1 for o in self.outcomes if o.bill_entry is not None)
+        n_failed = n - n_succeeded
+        return {
+            'run_id': self.run_id,
+            'vendor': self.vendor_slug,
+            'started': self.batch_started,
+            'ended': self.batch_ended,
+            'totals': {
+                'total': n,
+                'succeeded': n_succeeded,
+                'failed': n_failed,
+            },
+            'artifacts': {
+                'run_log': str((self.run_dir / 'run.log').resolve()),
+                'summary_csv': str(artifacts.get('summary_csv', '')),
+                'validation_log': str(
+                    (self.run_dir / 'customer_master_validation.log').resolve()
+                ),
+                'bills_csv': (
+                    str(artifacts['bills_csv']) if 'bills_csv' in artifacts else None
+                ),
+                'invoice_logs': [
+                    str(o.log_path.resolve()) for o in self.outcomes
+                ],
+            },
+        }

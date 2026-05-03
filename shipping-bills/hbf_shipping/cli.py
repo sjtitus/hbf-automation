@@ -1,14 +1,14 @@
 """
-Command-line entry point for the shipping-bills tool (stage 1).
+Command-line entry point for the shipping-bills tool.
 
-Parses arguments, dispatches to the requested vendor's stage-1 ShipTo
-extraction pipeline, and prints per-invoice + batch summaries.
+Parses arguments, dispatches to the requested vendor's pipeline, and
+emits the run artifacts: per-invoice logs, the customer-master
+validation log, a `summary.csv` with one row per invoice processed, a
+`manifest.json` indexing the run, and (unless `--dry-run` is set) the
+QuickBooks bills-import CSV.
 
-Stage 1 stops after producing canonical ShipTo records (page-1 + BOL).
-Customer matching, BillEntry construction, and QuickBooks CSV export
-will be re-introduced in stage 2 against the new ShipTo shape.
-
-Run from the project root — output directory (logs/) is CWD-relative.
+Run from the project root — output directories (`logs/`,
+`quickbooks-imports/`) are CWD-relative.
 """
 
 import argparse
@@ -70,6 +70,16 @@ Examples:
             'flag; default behavior is to log violations and continue.'
         ),
     )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help=(
+            'Run the full pipeline (parse, match, build bill entries) '
+            'and write summary.csv + manifest.json, but DO NOT write '
+            'the QuickBooks bills CSV. Bills are previewed in the run '
+            'log instead.'
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -79,6 +89,7 @@ Examples:
     try:
         pipeline = Pipeline(
             vendor, run_id=run_id, run_dir=run_dir,
+            vendor_slug=args.vendor,
             strict_master=args.strict_master,
         )
     except MasterValidationError as e:
@@ -87,6 +98,12 @@ Examples:
 
     pipeline.process_batch(args.invoice_dir)
     pipeline.report()
+    artifacts = pipeline.finalize(dry_run=args.dry_run)
+
+    print()
+    print("Run artifacts:")
+    for label, path in artifacts.items():
+        print(f"  {label}: {path}")
 
 
 if __name__ == '__main__':
