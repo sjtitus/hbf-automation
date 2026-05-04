@@ -105,6 +105,7 @@ def _make_stub_vendor():
     return SimpleNamespace(
         SHIPPING_COMPANY='Stub Shipping Co',
         REQUIRED_FIELDS=('invoice_number', 'so_number', 'total_amount'),
+        BOL_PROFILE=bol_ship_to.BADGER_PROFILE,
         parse_invoice=parse_invoice,
         extract_invoice_ship_to=extract_invoice_ship_to,
         build_bill_entry=build_bill_entry,
@@ -178,9 +179,10 @@ def test_pipeline_writes_all_artifacts_on_success(stub_run):
 
     artifacts = stub_run.pipeline.finalize(dry_run=False)
 
-    # All three artifacts written
+    # All four artifacts written
     assert artifacts['summary_csv'].exists()
     assert artifacts['bills_csv'].exists()
+    assert artifacts['consignee_discrepancies_csv'].exists()
     assert artifacts['manifest'].exists()
 
     # Summary CSV: header matches expected schema; one SUCCESS row
@@ -211,19 +213,28 @@ def test_pipeline_writes_all_artifacts_on_success(stub_run):
     assert bills[0]['Description'] == 'SO-99999'
     assert bills[0]['Amount'] == '123.45'
 
-    # Manifest: indexes the run, references both CSVs
+    # Manifest: indexes the run, references all CSVs
     manifest = json.loads(artifacts['manifest'].read_text())
     assert manifest['run_id'] == 'test-run-0001'
     assert manifest['vendor'] == 'stub'
     assert manifest['totals'] == {'total': 1, 'succeeded': 1, 'failed': 0}
     assert manifest['artifacts']['bills_csv'] is not None
     assert manifest['artifacts']['summary_csv'].endswith('summary.csv')
+    assert manifest['artifacts']['consignee_discrepancies_csv'].endswith(
+        'consignee_discrepancies.csv'
+    )
     assert len(manifest['artifacts']['invoice_logs']) == 1
+
+    # Consignee discrepancies: stub vendor's page-1 ship_to matches the
+    # synthetic master exactly, so the file is header-only (no rows).
+    with artifacts['consignee_discrepancies_csv'].open() as f:
+        disc_rows = list(csv.DictReader(f))
+    assert disc_rows == []
 
 
 def test_pipeline_dry_run_skips_bills_csv(stub_run):
-    """`dry_run=True` writes summary + manifest but NOT bills CSV.
-    Manifest's bills_csv field is None."""
+    """`dry_run=True` writes summary + manifest + consignee_discrepancies
+    but NOT bills CSV. Manifest's bills_csv field is None."""
     fake_pdf = stub_run.tmp_path / 'fake-invoice.pdf'
     fake_pdf.write_bytes(b'')
     stub_run.pipeline.process_invoice(fake_pdf)
@@ -231,11 +242,74 @@ def test_pipeline_dry_run_skips_bills_csv(stub_run):
     artifacts = stub_run.pipeline.finalize(dry_run=True)
 
     assert artifacts['summary_csv'].exists()
+    assert artifacts['consignee_discrepancies_csv'].exists()
     assert artifacts['manifest'].exists()
     assert 'bills_csv' not in artifacts
 
     manifest = json.loads(artifacts['manifest'].read_text())
     assert manifest['artifacts']['bills_csv'] is None
+    assert manifest['artifacts']['consignee_discrepancies_csv'].endswith(
+        'consignee_discrepancies.csv'
+    )
+
+
+def test_pipeline_writes_consignee_discrepancy_row_when_page1_disagrees_with_master(
+    stub_run, monkeypatch,
+):
+    """When the stub vendor's page-1 ship_to has a name that disagrees
+    with the master (address still matches, so the matcher resolves
+    INV_ONLY), a row lands in consignee_discrepancies.csv flagging the
+    name diff and carrying a suggested consignee block composed from
+    master fields."""
+    # Override the stub vendor's page-1 extractor: same address (so
+    # the 4-tuple lookup still resolves to the synthetic master row),
+    # different name.
+    def disagreeing_extract(pdf_path, invoice_data):
+        return InvoiceExtraction(
+            pdf_path=pdf_path,
+            ship_to=ShipTo(
+                name='Different Name LLC',
+                name_candidates=['Different Name LLC'],
+                address=NormalizedAddress(
+                    street='100 MAIN ST', line_2='', city='AUSTIN',
+                    state='TX', postcode='78701',
+                ),
+                source='page1',
+            ),
+            success=True,
+            failure_reason=None,
+            diagnostics='',
+        )
+    monkeypatch.setattr(
+        stub_run.pipeline.vendor,
+        'extract_invoice_ship_to',
+        disagreeing_extract,
+    )
+
+    fake_pdf = stub_run.tmp_path / 'disagreeing-invoice.pdf'
+    fake_pdf.write_bytes(b'')
+    stub_run.pipeline.process_invoice(fake_pdf)
+
+    artifacts = stub_run.pipeline.finalize(dry_run=False)
+
+    with artifacts['consignee_discrepancies_csv'].open() as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r['Invoice File'] == 'disagreeing-invoice.pdf'
+    assert r['Customer Name'] == 'Test Customer'           # master canonical
+    assert r['Page-1 Name'] == 'Different Name LLC'         # what shipper put
+    assert r['Name Differs'] == 'yes'
+    assert r['Street Differs'] == 'no'                      # both '100 MAIN ST'
+    assert r['City Differs'] == 'no'                        # both 'AUSTIN'
+    # Current cell: what the shipper wrote on the invoice
+    assert r['Current Consignee Name and Address'] == (
+        'Different Name LLC, 100 MAIN ST, AUSTIN, TX 78701'
+    )
+    # Suggested cell: master (gold standard); ready for paste-into-email
+    assert r['Suggested Consignee Name and Address'] == (
+        'Test Customer, 100 MAIN ST, AUSTIN, TX 78701'
+    )
 
 
 def test_pipeline_validate_fields_failure_records_fail_step(stub_run, monkeypatch):

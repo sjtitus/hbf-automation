@@ -32,6 +32,10 @@ from typing import Optional
 
 from .bill_entry import BillEntry
 from .bol_ship_to import extract_ship_to
+from .consignee_discrepancy import (
+    compare_consignee_to_master,
+    write_discrepancies_csv,
+)
 from .csv_export import format_bills_preview, write_bills_csv
 from .customer_address_map import (
     InvoiceMatchResult,
@@ -435,6 +439,24 @@ class Pipeline:
         write_processing_log(rows, summary_path)
         artifacts['summary_csv'] = summary_path.resolve()
 
+        # Consignee discrepancies CSV: always (header-only when nothing
+        # differs). Diagnostic/audit artifact; written even on dry-run.
+        discrepancies = [
+            d for d in (compare_consignee_to_master(o) for o in self.outcomes)
+            if d is not None
+        ]
+        discrepancies_path = self.run_dir / 'consignee_discrepancies.csv'
+        write_discrepancies_csv(
+            discrepancies, discrepancies_path,
+            run_id=self.run_id,
+            shipping_company=self.vendor.SHIPPING_COMPANY,
+        )
+        artifacts['consignee_discrepancies_csv'] = discrepancies_path.resolve()
+        logger.info(
+            f"Consignee discrepancies: {len(discrepancies)} "
+            f"(CSV: {discrepancies_path})"
+        )
+
         # Manifest: always
         manifest_path = write_manifest(self.run_dir, self._manifest_payload(artifacts))
         artifacts['manifest'] = manifest_path.resolve()
@@ -458,6 +480,9 @@ class Pipeline:
             'artifacts': {
                 'run_log': str((self.run_dir / 'run.log').resolve()),
                 'summary_csv': str(artifacts.get('summary_csv', '')),
+                'consignee_discrepancies_csv': str(
+                    artifacts.get('consignee_discrepancies_csv', '')
+                ),
                 'validation_log': str(
                     (self.run_dir / 'customer_master_validation.log').resolve()
                 ),
