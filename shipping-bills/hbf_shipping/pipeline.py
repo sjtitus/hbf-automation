@@ -181,7 +181,11 @@ class Pipeline:
                 except Exception as e:
                     logger.error(f"extract_invoice_ship_to raised: {e}", exc_info=True)
                 try:
-                    bol = extract_ship_to(pdf_path, diagnostic_dir=self.diagnostic_dir)
+                    bol = extract_ship_to(
+                        pdf_path,
+                        profile=self.vendor.BOL_PROFILE,
+                        diagnostic_dir=self.diagnostic_dir,
+                    )
                 except Exception as e:
                     logger.error(f"extract_ship_to (BOL) raised: {e}", exc_info=True)
 

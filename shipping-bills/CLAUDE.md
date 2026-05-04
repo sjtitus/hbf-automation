@@ -44,23 +44,28 @@ The production pipeline runs **both page-1 text extraction and page-2 BOL OCR** 
 ### Project Structure
 ```
 process_badger.py                      # Thin shim — injects --vendor badger and calls cli.main
+process_scotlynn.py                    # Thin shim — injects --vendor scotlynn and calls cli.main
 hbf_shipping/                          # The package
   cli.py                               # Argument parsing + vendor dispatch
   pipeline.py                          # Vendor-agnostic per-invoice processing loop + finalize()
   bill_entry.py                        # Shared BillEntry dataclass (data only)
   ship_to.py                           # Canonical ShipTo / NormalizedAddress types + USPS Pub-28 normalization helpers (shared by both extractors)
-  bol_ship_to.py                       # Page-2 BOL OCR extractor — produces a canonical ShipTo
+  bol_ship_to.py                       # Page-2 BOL OCR extractor — produces a canonical ShipTo. Profile-driven: BADGER_PROFILE, SCOTLYNN_PROFILE
   customer_address_map.py              # Customer-master loader, validator, and stage-2 matcher
   csv_export.py                        # Writes the QB-shaped batch-bills CSV
   processing_log.py                    # Per-invoice summary CSV writer (23 cols)
   run_logging.py                       # Per-run logging setup + per-invoice log handler + manifest writer
   vendors/
-    __init__.py                        # VENDORS = {'badger': ...}
+    __init__.py                        # VENDORS = {'badger': ..., 'scotlynn': ...}
     badger/
       __init__.py                      # Re-exports parse_invoice, extract_invoice_ship_to, build_bill_entry, REQUIRED_FIELDS, SHIPPING_COMPANY
       parser.py                        # Page-1 text extraction (all fields, including structured ShipTo)
       ocr.py                           # Page-2 BOL OCR — predates bol_ship_to.py, kept for ad-hoc debugging only
       rules.py                         # Badger business rules (bill-date, due-date, shipper→category)
+    scotlynn/
+      __init__.py                      # Re-exports parse_invoice, extract_invoice_ship_to, build_bill_entry, REQUIRED_FIELDS, SHIPPING_COMPANY, BOL_PROFILE
+      parser.py                        # Page-1 text extraction (label-anchored regex on plain text + layout mode for shipper/consignee block)
+      rules.py                         # Scotlynn business rules (bill-date, due-date, shipper→category)
 data/
   hbf-customer-shipping-addresses.xlsx # Customer master (production source; gitignored)
 badger-invoices/                       # Drop-zone for Badger invoice PDFs (gitignored)
@@ -87,6 +92,7 @@ Each `hbf_shipping/vendors/<name>/__init__.py` re-exports:
 | `build_bill_entry(invoice_data, customer_name)` | `BillEntry` | Applies the vendor's business rules to produce a shared `BillEntry`. |
 | `REQUIRED_FIELDS` | `tuple[str, ...]` | Field names that must be non-`None` in `invoice_data` for the pipeline to proceed past validation. |
 | `SHIPPING_COMPANY` | `str` | Display name for processing-log entries. |
+| `BOL_PROFILE` | `BolProfile` | Vendor's page-2 BOL extraction profile (anchors, header-fallback, divider, boundary phrases). Both Badger and Scotlynn declare their own profile constant, even though they're content-identical today (both ship under the same standard short-form BOL). Pipeline reads `vendor.BOL_PROFILE` directly — no implicit default. |
 
 Then add the vendor to `hbf_shipping/vendors/__init__.py::VENDORS` and (optionally) create a top-level `process_<vendor>.py` shim. `pipeline.py` consumes only this contract — it never imports vendor internals.
 
@@ -275,7 +281,6 @@ Batch processing aggregates every invoice in the run into a single CSV (single i
 ### Outstanding work
 - Outlook email intake (Graph API or manual drop into a watched folder)
 - Distributor-invoice handling (SO lookup in external system)
-- Scotlyn vendor workflow (`hbf_shipping/vendors/scotlyn/`)
 - MRS vendor workflow (`hbf_shipping/vendors/mrs/`)
 
 ### Technology Stack

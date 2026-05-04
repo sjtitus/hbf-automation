@@ -97,7 +97,7 @@ def test_vendor_regression(vendor_name, pdf_path, golden_path, customer_master):
     vendor = VENDORS[vendor_name]
     invoice_data, _reasons = vendor.parse_invoice(str(pdf_path))
     inv = vendor.extract_invoice_ship_to(pdf_path, invoice_data)
-    bol = bol_ship_to.extract_ship_to(pdf_path)
+    bol = bol_ship_to.extract_ship_to(pdf_path, profile=vendor.BOL_PROFILE)
     match = match_invoice_customer(inv, bol, customer_master)
     bill = vendor.build_bill_entry(invoice_data, match.customer_name)
 

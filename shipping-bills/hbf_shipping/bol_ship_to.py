@@ -105,6 +105,24 @@ BADGER_PROFILE = BolProfile(
 )
 
 
+# Scotlynn ships against the same standard short-form BOL Badger uses, so
+# the anchors and tuning values are content-identical today. Defined as a
+# separate constant so Scotlynn-specific drift later (different anchor
+# phrasing, different column dividers) only touches this profile.
+SCOTLYNN_PROFILE = BolProfile(
+    name="scotlynn",
+    upper_anchor_target="bill of lading number",
+    upper_anchor_short="BOLN",
+    lower_anchor_target="highland beef farms",
+    lower_anchor_short="HBF",
+    header_fallback_target="bill of lading short form",
+    header_fallback_fuzz_threshold=75,
+    header_fallback_pad_px=30,
+    divider_header_words=("SHORT", "FORM"),
+    boundary_phrases=DEFAULT_BOUNDARY_PHRASES,
+)
+
+
 # ============================================================
 # WALKER / OCR TUNING (ExtractConfig)
 # Generic knobs that govern walker behavior, OCR ROI sizing, dedupe

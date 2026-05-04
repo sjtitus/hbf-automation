@@ -83,7 +83,7 @@ Each run creates `logs/<vendor>-YYYY-MM-DDTHH-MM-SSET-XXXXXX/` containing:
 ## Supported Vendors
 
 - ✓ Badger State Western
-- ☐ Scotlyn (planned)
+- ✓ Scotlynn USA Division
 - ☐ MRS (planned)
 
 ## Running tests
@@ -123,6 +123,7 @@ git diff tests/fixtures/                     # review the diff
 
 ```
 ├── process_badger.py             # Thin shim → hbf_shipping.cli with --vendor badger
+├── process_scotlynn.py           # Thin shim → hbf_shipping.cli with --vendor scotlynn
 ├── hbf_shipping/                 # The package
 │   ├── cli.py                    # Argument parsing + vendor dispatch
 │   ├── pipeline.py               # Vendor-agnostic processing pipeline + finalize() (artifacts)
